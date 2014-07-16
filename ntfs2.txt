@@ -1,0 +1,436 @@
+Anton   something cool I just learned why helping r3dk0der on his machine to
+	get ntfs up and running
+Anton   on your machine
+Anton   as root do:
+Anton   su aia21
+Anton   then type screen -x
+Rich    hmm, errors, let me try from a real console
+Anton   make sure it is 80x25 in size
+Anton   you may need su - aia21
+Rich    it won't let me (as aia21) attach to the tty, just a second...
+Anton   hm, you probably need to be going in via ssh
+Anton   so you get a pts/ rather than a tty
+Rich    aha
+Rich    that's pretty cool
+Anton   yes
+Anton   (-:
+Anton   watching the guru at work or something like that (-:
+Rich    I just needed to change the ownership of the tty I was already using
+	so screen could work
+Anton   I see.
+Anton   and of course can be handy when talking about code
+Anton   so we can actually look at the same thing
+Rich    yes
+Rich    the size didn't matter. screen adjusted my view slightly to fit
+Anton   ah, cool
+Anton   I wonder what would happen if I resize the window to give it a more
+	useful number of lines?
+        Anton tries
+Anton   oh, no effect
+Anton   it keeps it to the previous set value
+Anton   there is a dotted line at line 25 and underneath just black
+Rich    it's probably screen trying to prevent you confusing it
+Anton   yes, I guess so
+Rich    I have a dotted line, too
+Anton   ok
+Anton   shall we both quit screen and run it again?
+Rich    ok
+Anton   say 80x60?
+Rich    ok
+Anton   ok running screen again 80x60 now
+Anton   oh...
+Anton   is there a tng tree in there?
+Rich    no, I've got that in my home, I'll move it...
+Anton   I was going to suggest to just bk lclone bk-2.5 tng
+Anton   but mv is just as good
+Anton   (-;
+Rich    different partitions, copying (yawn :-)
+Anton   ohoh. Linus has merged Ingo Molnar's patch
+Anton   hehe
+Anton   lclone would have been quicker (-;
+Anton   [uses hardlinks]
+Rich    ah, I do that with my kernel sources
+Anton   you can do it with BK, too. No need to waste all that space...
+Anton   not that you are short of space on /usr/src of course...
+Anton   I am not sure I like patches which end with "while it boots already so
+	the worst is over, there is lots of work left"
+Rich    hehe, was that Ingo?
+Anton   yes
+Anton   Linus just merged it into his bk tree...
+Anton   2.5.28 is going to be "interesting"
+Anton   you will need to chmod the ntfs-tng-2.5 directory a touch to allow me
+	to r-x it...
+Rich    just a sec
+Anton   the screen -x thing is really wonderful. I wish the X windows managers
+	could do that too.
+Anton   so I could just remotely access my machine and see the same desktop
+Anton   like vmware does under windows in fact
+Rich    ok, all done
+Rich    you have write privs in that dir, too
+Anton   ok
+Anton   ah you changed the group owner
+Anton   (-:
+Rich    actually, the write privs are a bit dubious given that it's a bk repos
+	:-)
+Anton   quite
+Anton   but doesn't matter
+Anton   at the moment anyway
+Anton   we went through ntfs_read_inode_mount already.
+Anton   so that's 1/4 of inode.c done, too (-:
+Rich    yep
+Anton   one little cool thing is ntfs_show_options but I think you are
+	familiar with that already
+Anton   ?
+Rich    ah yes
+Anton   hm, it didn't like that tags thing you did
+Anton   it is the stuff that shows in /proc/mounts
+Rich    no tags file yet
+Rich    yeah
+Anton   the vfs just calls us when necessary
+Anton   ok
+Anton   ok, when we want an inode, starting with its inode number, we need to
+	do ntfs_iget() which returns the struct inode
+Anton   we used that quite a bit during mount time.
+Rich    yep
+Anton   especially when loading all the system files
+Anton   this is quite simple (again 2.5 specifics here)
+Anton   iget5_locked()
+Anton   called with the sb, the inode number, two helper functions and our
+	ntfs_attr helper structure
+Anton   the reason why we can't use normal iget() is that we have several
+	inodes with the same inode number
+Anton   the normal inode and the attribute inodes
+Rich    ah right
+Anton   and iget only checks the superblock and the inode number and if both
+	match it finds the inode as matching
+Anton   iget5_locked uses ntfs_test_inode() to compare two inodes.
+Rich    I see
+Anton   this is under under inode_lock protection (a global VFS lock)
+Anton   so no race conditions are possible
+Rich    ok
+Anton   but the lock is a spin lock so we can't sleep
+Anton   note that the superblock is already matching before ntfs_test_inode is
+	called so no need to check it
+Anton   this is what iget5_locked in fact uses to see if the inode is already
+	there or not
+Rich    ok
+Anton   we compare the inode number first
+Anton   [note we have the "what we are looking for" info in the ntfs_attr *na]
+Anton   that is just what we passed to iget5_locked
+Rich    yep
+Anton   so if inode number matches
+Anton   and it is not an attribute we just check if it is AT_UNUSED.
+Anton   if it finds that it means it is not then we are looking for an
+	attribute inode but the inode we are comparing to is a normal inode so
+	it is a mismatch (return 0)
+Anton   hm, I screwed that sentence up a bit...
+Rich    so the vfs is happy to have several items in its cache with the same
+	inode number, (as long as the fs can tell them apart)
+Rich    apart
+Anton   correct
+Anton   that's what iget5_locked exists for. (-:
+Rich    ok
+Anton   we use na->type = AT_UNUSED to mean that we are looking for a "normal"
+	inode btw.
+Rich    I see
+Anton   and if the inode is an attribute inode then we check that the
+	attribute type, name and namelength match.
+Anton   I treat the match here as case sensitive.
+Anton   Whether that is good or not is matter for discussion...
+Anton   It's quicker that way... if we find MS changing case in some ntfs
+	version we can always change this to case-insensitive...
+Rich    hehe
+Anton   ok so, if iget5_locked finds the inode we are looking for, it just
+	returns it with increased reference count
+Rich    ok
+Anton   this is the boring case
+Anton   when it isn't there, it calls get_new_inode
+Anton   it allocates an inode (calls ntfs_alloc_inode())
+Anton   then tries the search to make sure someone else didn't add the inode
+	already
+Anton   (again we are now under the global inode_lock)
+Anton   and if it finds it now, it just throws away the new allocation and we
+	are back to the boring case.
+Rich    yes
+Anton   if it doesn't find it now
+Anton   it calls ntfs_set_inode.
+Anton   again still under the lock.
+Anton   or rather ntfs_init_locked_inode()
+Anton   we need to setup the type, name , and name_len as well as the Attr
+	flag in the ntfs inode
+Anton   before the inode_lock is dropped
+Anton   otherwise a concurrent ntfs_iget() would see an uninitialized
+	ntfs_inode and not match it even if it should match it or vice versa
+	and all hell would break loose...
+Anton   :se ls=2?
+Rich    laststatus
+Anton   ah
+Rich    it shows the filename
+Anton   ok
+Anton   setting the filename is a bit of a problem child
+Anton   because we need to actually copy the name, i.e. we need kmalloc()
+Rich    and we can't let that sleep
+Anton   so I cheated a bit on the grounds that 99.999% of names are $I30.
+Anton   exactly, hence GFP_ATOMIC allocation
+Anton   so we just set the name to the I30 global constant when it is $I3O.
+Anton   saves majority of kmalloc()s.
+Anton   uses less memory, too
+Rich    sensible
+Anton   glad you agree (-:
+Anton   so we return to get_new_inode with the inode setup.
+Anton   that than hashes the inode so it becomes visible to the kernel, sets
+	it locked (I_LOCK) and new (I_NEW) and drops the lock
+Anton   and returns it
+Anton   if the inode was just allocated obviously we need to actually read it
+	in now
+Anton   so we then call ntfs_read_locked_inode
+Anton   and then we remove the I_LOCK and I_NEW bits by calling
+	unlock_new_inode()
+Anton   [this is VFS provided]
+Anton   if reading failed due to ENOMEM we want to retry later, so we discard
+	the inode and return the error code instead
+Anton   otherwise we return the b0rken inode.
+Rich    ok
+Anton   it will have been marked bad
+Anton   so is_bad_inode(vi) will be true
+Anton   ntfs_read_locked_inode reads the inode from disk and sets up the inode
+	structure in memory
+Anton   we start with some VFS required things, we then initialise the
+	ntfs_inode
+Rich    ok
+Anton   (but not if we are running fir $MFT/$DATA at mount time... remember
+	from this afternoon)
+Rich    yes
+Anton   then we map the mft record (will explain all this mapping stuff
+	another time, it is orthogonal to reading inodes, just suffice to say
+	it gives us the mft record for the inode and it is locked against
+	concurrent access)
+Anton   and we do sanity checks
+Anton   I think no need to explain them...
+Rich    that's fine
+Anton   ok, then we get std info and copy the access times and such stuff
+Anton   then, we get the attribute list and if we find one we load it all
+Anton   again if we are loading $MFT we skip this... [we did it already]
+Rich    ok
+Anton   we attach the attr list to the ntfs inode
+Anton   if the thing is non-resident we have a helper function
+Anton   load_attribute_list
+Anton   which doesn't do anything fancy.
+Anton   just reads the decompressed run list sector by sector
+Rich    ok
+Anton   then we are done with that part
+Anton   now if we have a directory
+Anton   we find the index root
+Anton   and sanity check it
+Rich    ok
+Anton   and setup the flags
+Anton   this one is a point of note when writing in particular later on
+Anton   index_vcn_size is either the cluster size or the sector size,
+	depending on whether the cluster_size is bigger or small than the
+	index block size
+Rich    ok
+Anton   then we setup the attribute for this normal inode
+Anton   it is mst protected
+Anton   and has index allocation
+Anton   and is index allocation even
+Anton   I don't bother with index root as that is always very small
+Anton   I don't see much gain in using a whole struct inode/ntfs_inode + a
+	page cache page just for something like that...
+Rich    fair enough
+Anton   So we have the index allocation being the normal inode for directories.
+Anton   if the index root says this is a small index then we just set all
+	sizes to 0 and skip ahead.
+Anton   If it is a large dir we get the index allocation attribute
+Anton   and sanity check it
+Anton   and we set the sizes up appropriately
+Anton   then we get the directory bitmap attribute inode
+Rich    ok
+Anton   this is also silly to do this way, i.e. using a whole inode for this
+	but it simplifies code a lot so is well worth it
+Anton   then final directory specific stuff.
+Anton   give everyone r-x by default
+Anton   [need to change to include write later!]
+Rich    yes
+Anton   er, we do that already
+Anton   we apply the dmask
+Anton   and setup the operations
+Rich    ok
+Anton   so we can now read the director and so on
+Anton   if it was a file we do the same stuff but look for the data attribute
+	instead
+Rich    yes
+Anton   sanity check and setup the sizes.
+Anton   oh, one thing worth mentioning
+Anton   if there is no data attribute this is obviously a corrupt file
+Anton   except that some system files don't have an unnamed data attribute
+Anton   so we check for that
+Rich    ok
+Anton   we just check if the parent directory is $Extend (which is the only
+	one with a fixed inode number!)
+Anton   and if it is we return true
+Anton   otherwise false
+Rich    handy way of checking
+Anton   yes, took me a while to see this little detail (-:
+Anton   so again, we set rwx for all and apply the fmask
+Anton   and we set the operations, so people can now read files, open them,
+	lseek etc
+Anton   finally to make "du" work we set i_blocks to either allocated_size or
+	compressed_size.
+Rich    ok
+Anton   i_blocks is in units of 512 bytes.
+Anton   we put away the mft record and return success
+Anton   on error we just make_bad_inode()
+Anton   which does just what is shown
+Rich    ok
+Anton   and everything you try to do with it (or the VFS) just returns -EIO.
+Anton   and this is how simple is_bad_inode() is.
+Anton   very elegant I think
+Rich    hmm, yes
+Anton   so that is how we get inodes knowing only the inode number
+Anton   on every subsequent ntfs_iget() the inode is already in cache so the
+	reference count just gets bumped up
+Rich    yes
+Anton   Now we have the same thing for attribute inodes
+Anton   again iget5_locked is called from ntfs_attr_iget
+Anton   but here, we do not want to have bad attribute inodes hanging around
+Anton   so we just always throw them away on error and return the error code
+Rich    ok
+Anton   and we now use ntfs_read_locked_attr_inode
+Anton   to fill in all the info
+Anton   again we initialize the inode first, then we copy loads of stuff from
+	the base inode, i.e. the "normal" inode
+Rich    ok
+Anton   as a feature, I zero out the inode type, so the VFS doesn't get silly
+	ideas about directories, files, etc.
+Anton   I think zero usually means "special type"
+Rich    :q
+Anton   lol
+Rich    (I wasn't quitting your window, honest :-)
+Anton   then we just get the attribute
+Anton   and setup if resident , the sizes to be all equal
+Anton   and if not , we setup all the flags properly and the sizes
+Anton   and we of course sanity check
+Anton   finally
+Anton   we don't have any file or inode operations
+Anton   but we do have the usual address space operations to access the
+	attribute
+Rich    I see
+Anton   effectively by leaving i_op and i_fop NULL, noone can ever do anything
+	to them except us and the VM, e.g. it would write out pages from the
+	page cache under memory pressure
+Rich    yes
+Anton   [note it may be a BUG to leave them NULL, they may be need to be set
+	to ntfs_empty_iops and ntfs_empty_fops but if it is a bug we would
+	find out quickly enough as there will be an Oops with a null pointer
+	dereference...]
+Anton   we can always change later if necessary
+Rich    yeah, ok
+Anton   we get a reference count on the "normal" inode now
+Anton   I hate the idea of the normal inode disappearing under us with the
+	attribute inode still being active...
+Anton   and we point our attribute inode at it.
+Rich    ok
+Anton   ok that is how we get inodes
+Rich    great
+Anton   as a random throw in, we currently see how we allocate new inode /
+	free inodes which are no longer in use
+Anton   just a straight slab cache allocation/freeing
+Anton   with a little bit of setup for us thrown in on allocation and a bit of
+	sanity checks on freeing.
+Anton   freeing objects with reference counts != 0 is very bad...
+Rich    :-)
+Anton   and here is the inode init...
+Anton   nothing special, just setting most fields to zero/null
+Anton   and some locks, etc need their special setup calls
+Rich    ok
+Anton   we don't memset(0) because we already have the ->state, and attribute
+	setup elsewhere
+Anton   for the unions in the structure we just setup one of the union "parts"
+Anton   the bigger one
+Anton   so if we change ntfs_inode definition we need to change here, too.
+Anton   these two can be ignored, they are just silly place holders at the
+	moment
+Anton   now as last thing for tonight, when we call iput() to relinquish an
+	inode again
+Rich    ok
+Anton   we define ntfs_put_inode() which the VFS calls every time we do iput()
+Anton   we need this because of the directories which have the bitmap
+	attribute inode attached to them
+Anton   and that attachment caused the reference count on the normal directory
+	inode to be bumped up.
+Anton   (remember the igrab()
+Rich    circular ref counts
+Anton   )
+Anton   yes
+Anton   I can't see any other way to do this...
+Anton   So once we release the last reference _we_ hold on the directory, the
+	reference count is still too high
+Anton   because of the bitmap inode holding it
+Rich    hmm, not easy seeing as the VFS is handling the objects, not you
+Anton   so if it is a directory inode and the reference count is 2 [note
+	ntfs_put_inode is called _before_ the VFS decreases the reference
+	count]
+Anton   and further if and index allocation is present and we have an attached
+	bmp inode
+Anton   if an ...
+Anton   not if and
+Rich    yeah, I see
+Anton   then we iput() the bitmap inode which in turn drops the reference
+	count on US
+Anton   [as we will see in a bit]
+Anton   and we set bmp_ino = NULL just in case...
+Anton   then we return
+Anton   the VFS now decrements the reference count and it finds it just hit
+	zero.
+Rich    perfect :-)
+Anton   so the inode becomes inactive
+Anton   yep (-:
+Anton   for later on, note the inode is still in icache of the VFS!
+Anton   it will eventually get thrown out though...
+Rich    in the recently used list
+Anton   yeah
+Anton   but note it is around because this has repercussions on an subsequent
+	ntfs_iget()...
+Anton   but that comes later when we look at dir.c, another time...
+Anton   ok, now that the reference count reached zero
+Anton   and the VFS finally decides this struct inode is wasting memory which
+	it needs
+Anton   it calls ntfs_clear_big_inode()
+Anton   this first calls a helper to clear the ntfs inode
+Rich    aha
+Anton   [ignore the dirty crap for now]
+Anton   if it is a base inode with multiple extent mft records which are
+	loaded, nr_extents is > 0 so for each extent inode, we do a
+	ntfs_clear_extent_inode()
+Anton   [ignore this for now, we get back to this later on in mft.c when we
+	discuss handling of extent mft records]
+Rich    ok
+Anton   we then just discard the run list, the attribute list, the attribute
+	list run list, and the name (if it is not the global constant I30)
+Anton   finally if this is an attribute inode
+Anton   [now back in ntfs_clear_big_inode]
+Anton   _and_ if we are currently attached to our normal inode
+Anton   we use nr_extents = -1 to signify this fact, if we are detached we use
+	nr_extents = 0;
+Rich    ok
+Anton   we iput() our normal inode, and clear nr_extents and just to be safe
+	the base inode itself as well.
+Anton   clear inode returns and the VFS next calls ntfs_destroy_big_inode
+	which frees the actual struct inode and the inode is gone...
+Anton   and that's it for inode handling and inode.c is finished (minor
+	details left for extent mft records but those will come with mft.c)
+Rich    excellent
+Rich    thanks again for that
+Anton   np
+Anton   is the driver becoming a bit clearer now?
+Rich    yes, especially with that installment
+Anton   cool
+Rich    the explanation of where the different inode types fit in
+Anton   ok
+Rich    and the screen thing works well
+Anton   excellent , I thought it would be useful (-:
+Anton   shall we leave the window open?
+Anton   or just reopen it next time?
+Rich    yeah, that's fine
+Anton   ok
+Rich    open is fine

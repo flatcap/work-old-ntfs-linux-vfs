@@ -1,0 +1,599 @@
+Anton   lets go for dir.c and how directories are listed by the kernel
+Anton   i.e. ntfs_readdir()
+Anton   ntfs_readdir is called by the VFS whenever someone calls readdir(2) or
+	getdents(2).
+Anton   it works so that for each directory entry, ntfs_readdir calls the VFS
+	supplied callback "filldir" and gives it the parameter "dirent" so it
+	knows which directory it is being called about.
+Rich    ok
+Anton   As a locking aside the VFS takes i_sem (the inode semaphore) before
+	calling ntfs_readdir
+Anton   so we are excluded against someone messing with the directory contents
+Anton   The filldir callback returns either ok, go ahead, or tells us "stop,
+	can't take any more, user supplied buffer is full"
+Anton   And obviously when it tells us to stop we do so.
+Rich    yep
+Anton   The final point is that the filp given to us is the open file (or
+	rather open directory in this case)
+Anton   from that we get where in the directory we are supposed to start
+	reading entries
+Rich    ok
+Anton   In this way when filldir tells us to stop, it can later tell us to
+	continue where we left off
+Rich    I see
+Anton   filp->f_pos is the position where we need to start, and we need to
+	update ->f_pos at the end.
+Anton   As a concept for the positions we do this:
+Anton   at position zero we have the "." directory entry (which we need to
+	fake as NTFS doesn't have such a beast)
+Anton   at position f_pos = 1 we have the ".." directory entry (which we need
+	to fake also)
+Anton   then between f_pos > 1 and f_pos less then the mft record size we have
+	the index root attribute
+Anton   in that case we use f_pos == byte index inside index_root attribute
+	value
+Anton   that way we can seek to the right place very easily.
+Rich    ok
+Anton   and finally for f_pos >= mft_record_size, we take offset = (f_pos -
+	mft_record_size),
+Anton   offset being the byte position inside the index allocation attribute.
+Anton   In this way cleanly map all directory related stuff into one linear
+	space covered by f_pos.
+Rich    ok
+Anton   And finally to signal End Of Directory (EOD) we use f_pos = i_size.
+Anton   er, rather: f_pos = i_size + mft_record_size to be precise.
+Anton   (i_size of a directory only contains the size of the index allocation
+	attribute)
+Rich    ok
+Anton   ok that's the preliminaries
+Anton   so when we enter ntfs_readdir() we start of with checking if we are
+	being called for EOD and just return in that case.
+Anton   [as highlighted in the screen window]
+Rich    :-)
+Anton   a final VFS point here: when we return with f_pos = EOD, the VFS calls
+	us again!
+Anton   It doesn't know if there is nothing more to do or if we got bored...
+Rich    peculiar
+Anton   So we get called straight back with f_pos = EOD
+Anton   which is why I added the EOD check at the top of the function
+Rich    ok
+Anton   it just slows down readdir a lot otherwise...
+Anton   then we check if we are starting at f_pos = 0 and if so we call
+	filldir for our faked "." entry.
+Anton   At the moment we increment ->f_pos.
+Anton   And in general we update ->f_pos as we go along.
+Anton   We need to change this to only read f_pos once at beginning and then
+	to use a temporary f_pos variable which we update, and only just
+	before we do "return" should we set ->f_pos to the temporary
+	variable.
+Anton   That avoids problems with concurrent lseek() on the directory.
+Anton   [Don't know if you were following the LKML thread between Andrew
+	Morton and myself about this]
+Rich    no, but I'll find it later
+Anton   But that is a more or less trivial change, the function will still
+	work just the same...
+Anton   ok,
+Anton   then we check for f_pos = 1 and if so we fake the ".." entry and hand
+	it over to filldir()
+Anton   now we the usual stuff: get the mft record for the directory inode
+Anton   get a search context
+Anton   [note that mapping the mft record gives us even further protection
+	against directory modifications as the mft record is now locked for
+	reading]
+Rich    ok
+Anton   Now, NTFS uses Unicode
+Anton   the VFS uses character encodings of the users choice...
+Anton   so each directory entry we give to filldir() we have to convert first
+	to the current code page (vol->nls).
+Rich    ok
+Anton   And string conversion means we need a buffer to hold the destination
+	string.
+Anton   instead of allocating a buffer for each directory entry we now
+	allocate one buffer for the whole function, just using the maximum
+	NTFS supported file name size
+Rich    fair enough
+Anton   then we check whether the current f_pos is inside the index_root or
+	the index_allocation
+Anton   assuming it's in the index_root (ir) we just carry on.
+Anton   so we just get the ir attribute
+Anton   and get the attribute value in ir
+Anton   and set the first index entry in ie
+Rich    ok
+Anton   then we just loop over all index entries in the root in sequence
+Anton   calling ntfs_filldir() for each entry.
+Anton   thanks (-:
+Anton   at the top you see two syntactic sugar typedefs
+Anton   a bit silly but saves us from doing typecasts (-:
+Rich    aha
+Anton   and allows us to share the same ntfs_filldir() for both the index_root
+	and the index_allocation
+Anton   ntfs_filldir basically checks if the entry should be displayed or not
+Anton   we skip dos entries, and the root directory (we already emulated it...)
+Anton   and if the show_sys_files option was not given, we hide the system
+	files, too.
+Rich    yep
+Anton   we then just convert to current NLS
+Anton   see if it is a directory or normal file and pass the info onto the
+	filldir() call back
+Anton   note the highlighted code where we update f_pos appropriately
+Anton   depending on whether we are working with index_root or index_allocation
+Rich    ok
+Anton   and that's the index root handled. at the end of it, we either are at
+	EOD (if no index allocation present)
+Anton   or we carry on with the index allocation
+Anton   Actually one fine point
+Anton   in the loop, before calling ntfs_filldir()
+Anton   we check f_pos.
+Anton   if it is higher than the current entry we don't call ntfs_filldir()
+Anton   This means that we started off with a f_pos>0
+Rich    ok
+Anton   i.e. we are continuing a previously aborted readdir
+Anton   and we don't want to return the same entries twice.
+Anton   As a further safety net, note how the check is ">" rather than say "=="
+Anton   it means if someone deleted a file from the directory, or added one,
+	so that f_pos points into the middle of a directory entry now
+Anton   we are still ok
+Rich    I see
+Anton   yes
+Anton   this is why we actually do the loop instead of just starting at f_pos
+	offset inside the index root.
+Anton   That would be faster but we could be starting in the middle of an
+	entry and that would be rather catastrophic...
+Anton   ok, so now we get to the index allocation.
+Anton   Here I copied what the old ntfs driver did
+Anton   instead of scanning the directory B+tree in order, we just read each
+	INDEX_ALLOCATION block which is marked in use
+Anton   in the directory bitmap
+Anton   that is way quicker
+Rich    ok
+Anton   so we just iterate over all bits in the bitmap and for each set bit,
+	we get the corresponding index block and loop over all index entries
+	in that
+Anton   obviously, we can skip ahead in the bitmap and start at the current
+	f_pos - mft_record_size bit position.
+Anton   no point in starting with earlier index blocks. They have been all
+	completed by now.
+Rich    ok
+Anton   now remember that the index bitmap is open as an attribute inode.
+Anton   and attached at bmp_ino.
+Anton   ->bmp_ino I mean.
+Rich    yes
+Anton   Ok, BUT, also remember what happens on iput()
+Anton   we disconnect the two in order to drop the reference count of the
+	directory to zero.
+Rich    yes
+Anton   And if the inode was still in icache when the next readdir happens, we
+	just get the inode without going through our
+	ntfs_read_inode_locked().
+Anton   And bmp_ino is NULL.
+Anton   We dereference it and BANG.
+Anton   So to fix this, we check bmp_ino and if it is NULL we know what
+	happened.
+Rich    I see
+Anton   So we just obtain the attribute inode again.
+Anton   And we connect it to us (it automatically connects us to itself)
+Anton   then we do the bitmap scan.
+Anton   here is little complication.
+Anton   the bitmap is in the page cache, so we have to map a page, parse it,
+	unmap it, get next page, etc
+Anton   this is what we do here.
+Rich    yeah, I see
+Anton   then we can go around the bitmap...
+Anton   we keep going until we reach the page end or the bitmap end or we find
+	a set bit.
+Anton   once we find a set bit, we setup ia_pos to the correct position.
+Anton   ia_pos is the byte position inside the index allocation attribute.
+Anton   now as an optimization, we can have index buffers being smaller than a
+	page
+Anton   so we can reuse the page multiple times in that case
+Anton   no need to drop and reget the same page
+Anton   so we check that here.
+Rich    ok
+Anton   and we get a new page if necessary.
+Anton   from here it is easy.
+Anton   sanity checks (quite excessive ones probably)
+Anton   and then the loop for each directory entry
+Anton   pretty much the same things as with the index root
+Rich    yep
+Anton   we call ntfs_filldir for each entry, etc.
+Anton   then we just jump to find_next_index_buffer.
+Anton   which gets the next set bit in the bitmap, etc...
+Rich    fine
+Anton   once we finish the directory we will end up being dumped at EOD: or
+	unm_EOD.
+Anton   we set f_pos to end of directory position cleanup and return.
+Anton   and that's how we now have a working "ls" (-:
+Rich    wahay :-)
+Anton   just as a minor point, we also have our own open function for
+	directories
+Anton   there we just check i_size against MAX_LFS_FILESIZE
+Anton   [technically we should be checking sb->s_maxbytes but we know we
+	always set that to MAX_LFS_FILESIZE and comparing to a constant is
+	quicker...]
+Rich    ok
+Anton   we do this only on 32-bit architectures of course.
+Anton   on 64-bit ones the check should be optimized away by the compiler...
+Anton   We need the check since a huge directory could in theory overflow the
+	page->index...
+Anton   which would be needless to say a Bad Thing
+Rich    yes
+Anton   Ok.
+Anton   Next step of interest:
+Anton   how do we get more info about a directory?
+Anton   For example to stat a file, or to open a file.
+Anton   Again the VFS comes into play.
+Anton   e.g. user tries to access filename "fubar"
+Anton   The VFS looks in the dentry cache (dcache) and doesn't find it there
+Anton   so it prods ntfs and calls fs/ntfs/namei.c::ntfs_lookup()
+Anton   There are rather long comments...
+Rich    yes
+Anton   Want to read them before we carry on or shall we carry on without the
+	comments?
+Rich    just a second...
+Rich    ok, I've skimmed through the comment
+Anton   ok
+Anton   basically, we get two things:
+Anton   the parent directory inode inside which we are trying to open the file
+	"fubar"
+Rich    ok
+Anton   and the dentry @dent, which basically just contains the filename
+	"fubar" in a strange format called a "qstring"
+Anton   It's a VFS peculiarity, doesn't matter for us.
+Anton   We just want the name...
+Anton   The very first thing we need to do is to convert the name to Unicode
+	so we can search the directory for it.
+Anton   Remember that the VFS will most likely have gotten that name from our
+	readdir() previously
+Anton   so it will have been converted from Unicode previously
+Anton   and we now convert it back
+Rich    ok
+Anton   Remember the problems some people reported with some Chinese characters?
+Rich    do we get to see the hash (in the qstr) when we give the name to the
+	VFS?
+Anton   no.
+Rich    just wondering if we could cache the hash, at all
+Anton   If we want to mess about with the hash we need to provide our own
+	dcache methods
+Rich    oh well, forget that
+Anton   Yes, and there is not much point.
+Anton   There can be multiple dentries with the same hash...
+Rich    well, it's only a hash
+Anton   yep (-:
+Anton   Anyway, the problem reported was caused by the Unicode->NLS->Unicode
+	not giving back the value we started with.
+Rich    oh yes
+Anton   So if anyone complains we just tell them use "UTF-8" code page and all
+	will work.
+Anton   That is guaranteed to give the same value.
+Anton   [can't remember the technical name for the transformation where this
+	is guaranteed.]
+Anton   Anyways
+Rich    equivalent?  symmetric?
+Anton   symmetric, that's the one, thanks
+Anton   we convert the name and then we call
+	fs/ntfs/dir.c::ntfs_lookup_inode_by_name() to actually search for the
+	Unicode name in the directory.
+Anton   want to skim the comment here, too?
+Rich    please :-)
+Anton   ok
+Anton   we do the lookup in the most stupidly simplest way possible
+Anton   we just start at the beginning of the directory and follow the B+tree
+	until we either find the name or we find we have gone too far and
+	abort.
+Rich    ok
+Anton   so we get the mft record, a search context, find the index root and
+	start looping on all index entries.
+Anton   we check for overflows and for INDEX_ENTRY_END and abort if found
+Rich    yep
+Anton   Now we first do a case sensitive file name comparison.
+Anton   If that matches we have found a 100% match and can be happy.
+Anton   But there is an oddity.
+Anton   If we have found a short file name
+Anton   we want to tell this to ntfs_lookup()
+Anton   We have this little ntfs_name structure to do so.
+Anton   It can contain the mft reference, the file name type flags, the file
+	name length and the file name itself if necessary.
+Rich    yep
+Anton   so we allocate such a beast and set it up
+Anton   when it is a dos file name we don't actually care what the name is
+Anton   we just need to know that it is a DOS name.
+Anton   and the correct mft reference for it.
+Rich    ok
+Anton   [do you want me to explain why now or carry on and explain later when
+	we reach the code which makes use of this info?]
+Rich    carry on, for now
+Anton   ok
+Anton   If the match was perfect and not a DOS file name, we free a possibly
+	existing "ntfs_name" and return the mft reference of the perfect
+	match.
+Anton   When we have such a case there is no need for ntfs_name passing
+	around. The match is just dandy.
+Anton   now if there was no match, we try again, but we try case insensitive
+Anton   but of course, we only do this if the user didn't mount with the
+	case_sensitive option.
+Rich    yes
+Anton   Note the bug check here.
+Anton   (Well sanity check really)
+Anton   We only make use of "ntfs_name" passing around when we find a DOS or a
+	Win32 file name.
+Anton   In fact the highlighted check makes sure we never get here for POSIX
+	file names.
+Anton   They are and always will be case sensitive.
+Rich    ok
+Anton   So if the filename is not DOS, we need to append the name itself to
+	the ntfs_name structure
+Rich    yep
+Anton   so we allocate some memory and copy the name in
+Anton   and in either case we set the mft reference and the type of the file
+	name in ntfs_name.
+Anton   Now the trick. even if we did match, we continue searching!
+Rich    in case there's anything else that looks the same in the current locale
+Anton   Because there may be a perfect match waiting in form of a POSIX file
+	name later on...
+Rich    ah, ok
+Anton   Note we are now at Unicode level so the current locale has become
+	irrelevant.
+Anton   There is no way we can have a match if the transformation was not
+	symmetric.
+Anton   That is not just ntfs, all fs suffer from the same problem...
+Anton   At least all which don't use current locale on disk...
+Rich    ok
+Anton   so we are not alone (-:
+Anton   ok, now we know we didn't match.
+Anton   but the question is do we go left or right in the B+tree.
+Anton   So we perform the full blown file name collation.
+Anton   [algorithm nicked from windows ntfs driver]
+Anton   only took a month or so to reverse engineer it...
+Rich    :-)
+Anton   so this gives us whether we should continue to the next entry or we
+	should break (and descend down the B+tree)
+Rich    yep
+Anton   if we continue it easy, just loop the loop. (-:
+Anton   the descend case is next
+Anton   we check if the current entry actually has children to descend into.
+Anton   if not, we either return the name we matched earlier on
+	CASE_INSENSITIVE match
+Anton   or we return -ENOENT to say "sorry, there is no such file"
+Anton   otherwise we continue by descending into the appropriate directory
+	index block.
+Anton   we get the page for it.
+Anton   loads of sanity checks as before
+Anton   and we loop the index entries
+Anton   just like above,
+Anton   we check for overflow, directory end, then case sensitive match, then
+	case insensitive
+Anton   code is in fact identical!
+Anton   and we collate again identical!
+Rich    I was just thinking "duplication"
+Anton   yup.
+Anton   it really ought to be folded into a helper function.
+Anton   but when writing this I wanted a working driver... and couldn't care
+	less...
+Anton   things like this can be cleaned up any time in a .release.
+Anton   so once we loop through the index block if we still haven't got a
+	perfect match
+Rich    that's how I tend to work.  cut'n'paste like crazy, then look for
+	patterns.
+Anton   yes (-:
+Anton   we check the current entry for having a child node and descend again
+	if it does.
+Anton   otherwise we check if we had a CASE_INSENSITIVE match and return that
+Rich    ok
+Anton   or we return -ENOENT;
+Anton   and that's how we do the lookup.
+Anton   we then return to ntfs_lookup().
+Anton   Note we have now: the return value is the mft reference of the found
+	directory entry.
+Anton   and possibly ntfs_name* returned in &uname.
+Anton   that happens only for imperfect matches (where perfect == case
+	sensitive and not DOS)
+Rich    er name?
+Anton   yes, indeed.
+Anton   let me check my copy
+Anton   phew it is "name"
+Anton   (-:
+Rich    :-)
+Anton   I claim temporary confusion. (-;
+Anton   note ntfs_nlstoucs actually allocated the memory and we have to free
+	it now...
+Rich    ok
+Anton   ok, if we had an error during lookup IS_ERR_MREF(mref) will be true.
+Anton   this is analogous to the IS_ERR() macros but works on MFT entries.
+Rich    ok
+Anton   it checks the mft number being negative as opposed to the whole mft
+	reference
+Anton   since the sequence number is u16 so it can well have the top bit set
+	to 1.
+Rich    nice
+Anton   (-:
+Anton   if an error did occur,
+Anton   we check if it is a simple ENOENT.
+Anton   which is ok, not really an error.
+Anton   so we create a "negative" dentry.
+Anton   i.e. a dentry which doesn't have an inode attached to it.
+Rich    ok
+Anton   The VFS uses these beasts because the next logical operation is
+	"create file"
+Anton   usually.
+Rich    aha
+Anton   For example if you do creat(2), the VFS actually does a dcache lookup
+	and if that fails it does a ntfs_lookup() and only if that fails too
+	will it create the file.
+Rich    ok
+Anton   so by caching the negative dentry the VFS knows to not call
+	ntfs_lookup() again.
+Anton   anyway, negative dentries are created using d_add and passing in a
+	NULL inode.
+Anton   ntfs_lookup() is supposed to return NULL on success.
+Anton   I will show you why...
+Anton   the VFS does a dcache lookup.
+Anton   when that fails, it allocates a new dentry and writes the name to it.
+Anton   then it calls ntfs_lookup.
+Anton   and if that returns NULL, the VFS uses the allocated dentry, assuming
+	that we have done a d_add() of some form or another with the entry.
+Rich    ok
+Anton   However, if ->lookup returns a dentry, the allocated dentry is thrown
+	away!
+Anton   and the returned one is used instead.
+Anton   this means that ->lookup is allowed to return a different dentry from
+	the one the VFS asked for!
+Anton   and we in fact make use of this as we shall see in a bit
+Rich    right, I see
+Anton   ok
+Anton   back to ntfs_lookup
+Anton   (-:
+Anton   we do an ntfs_iget to get our hands on the inode with the inode number
+	found by ntfs_lookup_inode_by_name
+Anton   if this returns an error, we just return the error.
+Anton   not much else we can do really.
+Anton   it is not that there is no such directory entry, so we can't return a
+	negative dentry.
+Anton   and we can't return a "positive" dentry because we failed to get the
+	inode.
+Anton   if all was ok we verify the mft sequence number
+Anton   the one we are looking for should match to the inode we just got
+Anton   if they don't match this is a stale reference. Bad.
+Anton   so we throw away the inode (iput())
+Anton   and return -EIO.
+Anton   if all was ok, we instantiate the dentry.
+Anton   by attaching (d_add()) the inode to the dentry.
+Anton   and again we return NULL.
+Anton   Note this is only if the match was perfect and not a DOS name.
+Anton   Otherwise we jump out (too indented already and this belongs into a
+	separate function really, but again left for future optimization)
+Anton   We need to handle the return ntfs_name.
+Anton   with me so far?
+Rich    yes, still here
+Anton   ok
+Anton   you just went quiet so I started wondering... (-;
+Anton   ok
+Anton   The idea here is that we have found a directory entry which is not a
+	perfect match.
+Anton   So we really do not want it to exist in the dcache.
+Rich    ok
+Anton   We only want to have perfect matches in the dcache.
+Anton   This is for a few reasons:
+Anton   1) if it is a directory, having multiple dentries effectively is like
+	having multiple hardlinks
+Anton   i.e. if you do "ls -l mydirwithlongfilename" and "ls -l mydirw~1" and
+	"ls -l mydirwithLONGfilename"
+Anton   you end up with a dentry for each these
+Anton   AND, you end up with a dentry for each of the files inside each of
+	these dentries (if that makes sense)
+Rich    because they appear to have different parents
+Anton   indeed
+Rich    eek
+Anton   quite!
+Anton   this is why we cannot allow to have more than one dentry per directory
+Anton   and the easiest way to avoid this is to make sure we only have one
+	dentry for each perfect match and we never have dentries to DOS file
+	names.
+Rich    I see
+Anton   that way we are left with the posix names and the long file name
+	(win32) which all need to have at least one letter different in case.
+Anton   Even windows is that sane to not allow two 100% identical names.
+Anton   This scheme works fine, except if some idiot made a real hard link to
+	a directory.
+Anton   UNIX forbids this.
+Anton   All the ln.exe utilities I found for windows including the Microsoft
+	one, refused to allow creation of a hardlink to a directory.
+Anton   So I just assume that this will never happen.
+Anton   If some twat writes a program to create a hardlink to a directory they
+	can keep the pieces of corrupt file system which we will cause on
+	write...
+Rich    hehe
+Anton   Certainly no standard utility would allow it.
+Anton   (-:
+Rich    fortunately they're easy to spot
+Anton   yes
+Anton   So to ensure the single dentry thing,
+Anton   if we matched a DOS file name (case 3), we need to find the win32 file
+	name that corresponds to it and return the dentry for that instead.
+Anton   And the VFS will then throw the dentry for the short file name in the
+	bin.
+Rich    ok
+Anton   And the other possibility is that we matched a win32 file name (or a
+	win32+dos shared name)
+Anton   (case 2)
+Anton   in which case we have to find the dentry with the correct spelling and
+	return that instead.
+Anton   again the VFS then throws the misspelled dentry in the bin.
+Rich    I see
+Anton   so we need to do that.
+Anton   First we need to know the name of the dentry we are trying to get at.
+Anton   In case 2, we already know the name, we passed it in ntfs_name
+	beforehand.
+Anton   so we convert the Unicode name to the current codepage and throw away
+	the ntfs_name which is now useless.
+Anton   we then check that the name converted ok...
+Anton   we then ask the VFS to create hash for the newly converted file name.
+Anton   this is done for us by full_name_hash().
+Rich    ok
+Anton   Note that nls_name is the already mentioned qstring.
+Anton   It contains the name, the length and the hash.
+Anton   hence the nls_name.hash = ...
+Anton   now, we have a valid qstring!
+Anton   containing the correct name we are looking for.
+Anton   so we search for it in dcache.
+Anton   if it doesn, we allocate one.
+Rich    ok
+Anton   this makes a copy of the qstring nls_name.
+Anton   so we can throw it away.
+Anton   assuming the allocation was ok, we instantiate the dentry
+Anton   and attach the inode to the new dentry.
+Anton   finally we return the dentry. (the VFS throws away the old one)
+Anton   (as you will remember)
+Rich    yep
+Anton   if we did find a dentry for this name already.
+Anton   (quite likely after a while, e.g. multiple accesses using the
+	misspelled name will always go via ntfs_lookup(), since there is no
+	dcache entry for the misspelled name
+Anton   )
+Rich    I see
+Anton   (this is very slow but we just operate on the assumption that in 99%
+	of cases people will use the correct name, e.g. via tab expansion, via
+	a GUI file manager, etc)
+Rich    ok
+Anton   so we have a dentry.
+Anton   It better point at the same inode that we have got!
+Anton   if it doesn't BUG().
+Anton   we put the inode (remember we did ntfs_iget() earlier)
+Anton   and return the existing dentry. (vfs throwing away the other one)
+Anton   one special case.
+Anton   it is possible that a dentry existed but that it was negative.
+Anton   i.e. no inode was attached at all.
+Anton   that's fine, too.
+Anton   we just instantiate the dentry by attaching the inode we got earlier
+	to it.
+Anton   and return it.
+Rich    ok
+Anton   (once again vfs throws away old one)
+Anton   that's it. now just remains to go back and see what happens with DOS
+	file names
+Anton   It's very easy
+Anton   We know we had a DOS file name.
+Anton   we know the inode
+Anton   so we don't need the ntfs_name any more
+Anton   so kfree()
+Anton   and since each DOS name MUST have a Win32 counterpart, we just look
+	for that.
+Anton   so we map the mft record, get a search context
+Anton   and we just loop over all the file name attributes in the inode.
+Anton   some checks and then we get a pointer to the actual file name
+	attribute value.
+Anton   more checks...
+Anton   we loop until we find the win32 name.
+Rich    ok
+Anton   finally we convert the name to the current codepage and cleanup.
+Anton   and we are back to the same as before.
+Anton   calculate hash of name, and try to find the dentry...
+Anton   etc...
+Anton   etc...
+Rich    yep
+Anton   and that's that.
+Rich    wahay!
+Anton   we can now mount/umount, read directory contents, and find inodes by
+	name
+Rich    thanks, yet again, for that :-)
+Anton   you are welcome (-:
+Anton   lets just finish off file.c, too.

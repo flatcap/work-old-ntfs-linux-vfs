@@ -1,0 +1,391 @@
+Anton   these I just copied from mkntfs I think 
+Anton   and adapted a bit
+Anton   fairly obvious, probably don't work in that form, but doesn't matter...
+Anton   it's not like we are using them now
+Rich    alright
+Anton   map record, initialize, mark dirty, unmap is the idea
+Anton   and the initialization just sets up an NTFS 1.2 MFT record header with
+	a $END attribute
+Anton   i.e. empty record
+Rich    ok
+Anton   we probably will want to vary the recording depending on NTFS version
+	in use...
+Anton   ok,
+Anton   so when we need info from an mft record, we need to
+	map_mft_record(ntfs_inode)
+Anton   this will return a pointer into a page cache page containing the mft
+	record we want
+Rich    ok
+Anton   read the comments and see if it makes sense...
+Rich    nearly finished
+Rich    ok
+Anton   ok how this all works is quite simple (after switching to just a MUTEX!)
+Anton   we increment the use count on the ntfs inode
+Anton   because we may sleep waiting for the mrec_lock semaphore to be
+	acquired and we don't want someone else getting rid of the inode
+	underneath us
+Rich    ok
+Anton   [note I am not sure we need to do this. it seems sensible to do so as
+	there can be ntfs inodes without vfs inodes attached so this would be
+	the only use count they have...]
+Anton   [in fact for those inodes it would be a must to have the counter AFAICS]
+Anton   now we take the mutex
+Anton   once we have it, we now have _exclusive_ access to the mft record
+Anton   noone can touch it anymore, everyone will be put to sleep until we do
+	the "up()"
+Rich    ok
+Anton   we map the page containing the mft record
+Anton   we can probably fold that function into map_mft_record but they both
+	used to be a lot bigger so they were separate...
+Anton   on success we return the mft record pointer.
+Rich    ok
+Anton   on error, we release everything in reverse order.
+Anton   and return the error.
+Rich    yep
+Anton   ok, now to this little function, getting the page
+Anton   make sure there isn't a page attached already.
+Anton   calculate the page index and offset within the page of the mft record
+	we want
+Rich    I see
+Anton   what is the last page in the mft?
+Anton   don't want to read beyond that...
+Anton   do we exceed the end? or are we in the last page?
+Anton   (note the >=)
+Anton   further are we really exceeding the last valid record?
+Anton   if so return -ENOENT.
+Rich    ok
+Anton   one point of note.
+Anton   we zero ni->page and ni->page_ofs whenever they are not in use.
+Anton   we use BUG_ON(ni->page) quite a lot for sanity checking (at least for
+	now)
+Rich    ok
+Anton   ok, read the correct page from the $MFT/$DATA
+Anton   we have the mft inode open and attached to the ntfs volume
+Anton   if the page is valid, setup ni->page and page_ofs and return the
+	address of the mft record in the page
+Anton   on error just fall through
+Rich    ok
+Anton   now, ntfs_map_page
+Anton   just calls read_cache_page()
+Rich    ok
+Anton   if not an error, wait for the page to be unlocked
+Anton   (noop if already unlocked)
+Anton   map the thing (noop on lowmem box)
+Anton   if page is uptodate and there are no errors in the page, return the
+	page.
+Anton   else just unmap it and return error.
+Rich    ok
+Anton   ok
+Anton   we supply the mapping (mft_ino->i_mapping)
+Anton   the index
+Anton   the readpage function
+Rich    ok
+Anton   and NULL since we don't make use of the extra data (just ignore this
+	one, irrelevant for us)
+Anton   hrm, how do you get to next one?
+Anton   ah yes!
+Anton   had forgotten
+Anton   this is the interesting bit
+Anton   is the page in the page cache already?
+Anton   yes, just return it!
+Rich    ok
+Anton   no
+Anton   allocate a new page
+Anton   add it to the page cache at the right index and into the right mapping
+Anton   if someone else added the page while we were allocating the page, repeat
+Anton   find the page, now we will find it!
+Anton   throw away the one we allocated
+Anton   return the found page
+Anton   handle errors.
+Anton   ok we have a new page
+Anton   we just allocated it
+Anton   it is locked
+Anton   the structure is setup
+Anton   but the contents of the data are not initialized at all
+Anton   (random junk)
+Rich    ok
+Anton   call our supplied "filler" i.e. ntfs_readpage.
+Rich    I see
+Anton   which is what we use as mft_ino->i_mapping->readpage
+Anton   error?
+Anton   throw away the page and return error
+Anton   return the new page or error
+Anton   note the page may still be locked (and probably is, waiting for i/o to
+	complete)
+Rich    ok
+Anton   VM stuff
+Anton   to do with page aging I think
+Anton   ignore (-:
+Rich    will do
+Anton   Was the page made up to date in a synchronous fashion? If so return it
+	now.
+Anton   this happens when it was already in the page cache for example
+Rich    ok
+Anton   hrm odd
+Anton   it locks the page now?!?
+Anton   locks the page
+Rich    and expects the filler to unlock it
+Anton   if there is no mapping, just unlock and release the page and try again.
+Anton   yes.
+Anton   I think this only can happen if the page was already in the page cache
+Anton   it doesn't make sense otherwise
+Anton   we already called the filler in __read_cache_page()
+Rich    unless it's to stop people reading it, before we've had a chance to
+	fill it
+Anton   but we did fill it if it was not in the page cache
+Anton   that is the point (-:
+Rich    hmm
+Anton   see?
+Rich    yes
+Anton   admittedly that only happened with NEW pages
+Anton   already existing ones OTOH that hasn't happened with
+Anton   [as an aside if a page was first written to and is being read after
+	that, it will exist but ->readpage will never have been called on it]
+Anton   [so it may not be uptodate]
+Rich    ok
+Anton   [if the write only filled the page partially]
+Anton   [the remainder is just zeroed]
+Anton   so if the page is not uptodate, we lock it.
+Rich    ok
+Anton   ok, so the locking actually waits for the previous lock to be released
+Anton   so if this is a new page, it will wait until ->filler has filled and
+	unlocked the page
+Anton   if it is an old page it will lock it now as it will not have been locked
+Anton   ok?
+Rich    yes, ok
+Anton   cool
+Anton   if there is no mapping something went wrong, so try again.
+Anton   I really cannot see how this could ever happen...
+Anton   perhaps it is one of these "paranaoia" checks
+Anton   + fixups
+Anton   if the page is now uptodate, unlock and return it
+Rich    ok
+Anton   [this will have happened if it was a new page, ntfs_readpage() will
+	have set the page uptodate before unlocking it]
+Anton   but if it was an old page we have just locked it so unless someone
+	else read it just a nano-second before us, it will still be not
+	uptodate
+Anton   so we try to read it
+Rich    ok
+Anton   abort on error, throwing away the page or return the page
+Anton   these are the address space ops we use for mft_ino especially
+Anton   we just use the standard ntfs_readpage
+Rich    yes
+Anton   it will get here for $MFT/$DATA
+Anton   and just treat it as a normal file
+Anton   and the async io completion handler will do the mst fixups
+Rich    ok
+Anton   set uptodate if no errors occurred
+Anton   and unlock it
+Anton   this should be familiar from last time...
+Rich    yes
+Anton   Just repeating it so you see how it all fits together.
+Rich    yep, cheers
+Anton   so we have either read the old page, or read from disk a new one
+Anton   and we can now return the mft record pointer which is nicely fixed up
+	and ready for action (-:
+Anton   note how we have 1) incremented the use count on the page, thus it
+	cannot disappear
+Anton   2) we have kmap()ed the page so we can use page_address()
+Rich    ok and ok
+Anton   3) we are now holding the mrec_lock mutex.
+Anton   which means noone else can touch the record
+Rich    ok
+Anton   because of 3) we want to minimise the lock holding time
+Rich    yeah, I see
+Anton   also because of the mutex, we have to be careful what functions we
+	call (see essay from earlier today (-;)
+Rich    indeed
+Anton   the one safe thing is of course ntfs_lookup().
+Anton   [as long as the mapped mft record is a base record and not an extent
+	record but that should always be the case anyhow]
+Anton   [at least if we are going to be calling ntfs_lookup()]
+Rich    ok
+Anton   ok
+Anton   so when we are done reading the record, we need to undo points 3, 2,
+	and 1 from above
+Anton   [obviously in reverse order]
+Anton   that is unmap_mft_record()
+Rich    yep
+Anton   are we calling for an inode that hasn't been mapped? bug
+Anton   unmap the page
+Anton   [again this used to be more complicated before the mutex happened...]
+Anton   [again it can be done in one function...]
+Rich    ok
+Anton   up the mutex and decrement the use count. return. done.
+Anton   silly second check
+Anton   important! if we modified the mft record, we need to have set it
+	dirty, presumably we will code a new function "set_mft_record_dirty()"
+	or whatever...
+Anton   we possibly need to take care of this now.
+Rich    ok
+Anton   just unmap the page
+Anton   which just kunmap()s [noop on lowmem]
+Anton   and releases the page cache page
+Anton   [it of course remains in the page cache unless memory pressure evicts
+	it]
+Rich    yep, I see
+Anton   set those to zero so we don't BUG later...
+Anton   if we have confidence in us so much one day we could remove both the
+	BUG_ON()s and the zeroing here...
+Anton   (-:
+Rich    some day, perhaps :-)
+Anton   ok, one left
+Anton   mapping extent mft records is different.
+Anton   they are special in that they need to be attached to their parent
+	mft_record
+Rich    yep, ok
+Anton   in fact we supply the base ntfs inode when calling the function
+Anton   and we return an ntfs inode for the extent mft record
+Rich    ok
+Anton   [note the extent ntfs inode will not have a vfs inode attached]
+Anton   [there is no point]
+Anton   just increment the use count on the base inode so it doesn't disappear
+Rich    yep
+Anton   we maintain this for as long as the extent inode is attached to the
+	base inode.
+Anton   we _never_ want to have an extent inode without its base... it would
+	get too confusing IMO.
+Rich    fair enough
+Anton   first we check if this extent inode is already attached to the base
+	inode
+Anton   note we have a mutex for accessing all the "extent" inode fields in
+	the ntfs inode.
+Anton   so we take it
+Anton   [we keep the extent inodes in an kmalloc()ed array so we can't have
+	more than one person messing with that]
+Rich    ok
+Anton   are there attached extent inodes?
+Anton   yes -> get the array of xxx
+Anton   yes -> get the array of extent inodes
+Anton   for all extent inodes in the array:
+Anton   if it is not the right one, continue search
+Rich    ok
+Anton   it is the right one
+Anton   increment the use count so it doesn't disappear either.
+Anton   did we find an inode?
+Anton   yes
+Anton   release the lock, no more messing with the "extent" fields
+Anton   drop the base inode added reference, no longer necessary. (hmm)
+Anton   (hmm - Ah! yes, we already have the increment done the first time we
+	got it!)
+Anton   (we don't want to increment each time)
+Rich    yes
+Anton   now map the extent mft record, we want exclusive access.
+Anton   need to drop the count again
+Anton   to balance this one
+Anton   ok?
+Rich    yes
+Anton   if there was no error
+Anton   if the sequence number is right, we are done, return the inode and the
+	mft record.
+Rich    ok
+Anton   otherwise it was a stale reference, unmap the mft record and return an
+	error
+Anton   again if map_mft_record failed itself, return error
+Anton   ni was NULL, i.e. the inode isn't attached yet
+Anton   allocate a new one from the slab cache
+Rich    ok
+Anton   allocate and initialize the state.
+Anton   initialize with defaults
+Rich    ok
+Anton   it is unused for now.
+Anton   also not just for now
+Anton   it is an extent inode
+Anton   ti has no VFS inode
+Anton   so it never becomes part of the VFS inode cache
+Rich    ok
+Anton   so these fields are rather pointless
+Rich    yes
+Anton   but we set them to something sane for when we hand this inode to
+	"ntfs_write_inode()" or whatever one day so it knows what to do...
+Anton   allocation failed. release mutex and base inode and error
+Anton   the real setup.
+Anton   for extent inodes we set nr_extents = -1;
+Rich    ok
+Anton   = 0 means it is a base inode without attached extents and > 0 means it
+	is a base inode with attached extents.
+Anton   and we make the inode point to the base inode
+Rich    yep
+Anton   map it
+Anton   on error, release lock, decrement ref count on base,
+	clear_extent_inode() and abort with error
+Anton   error...
+Anton   just clears the inode and then throws it away
+Rich    yep
+Anton   it better be unmapped...
+Anton   it is -1...
+Anton   is NULL
+Anton   is null
+Anton   is null
+Anton   is null
+Anton   rather boring (-:
+Rich    :-)
+Anton   someone had it mapped?
+Anton   or referenced?
+Anton   bye, bye, miss american pie...
+Anton   er, ok, just deallocate it
+Anton   (-;
+Anton   is the reference stale?
+Anton   tell the error handling code it has to destroy the allocated inode
+Rich    ok
+Anton   return error
+Anton   unmap, unlock, release ref,
+Anton   it told us to destroy it, so do it
+Anton   is there no space left in the array?
+Anton   I made the random decision to grow the array in multiples of 4 pointers.
+Rich    ok, fair enough
+Anton   4*4 = 16 bytes on i386 or 4*8 = 32 bytes on ia64
+Anton   nice round numbers
+Anton   (-:
+Rich    yeah
+Anton   kmalloc() will be happy
+Anton   we had enough space
+Anton   just add it at the end of the array and increment the counter
+Anton   finished fiddling with the array, drop the lock
+Rich    yep
+Anton   hmm
+Anton   we drop the base inode ref count, too.
+Anton   and return the extent inode
+Anton   ah yes, I remember
+Anton   hmm = we really drop it, i.e. the base inode can now disappear under us
+Anton   BUT
+Anton   when it disappears, the VFS will call ntfs_clear_inode()
+Anton   correction ntfs_clear_big_inode()
+Anton   which does this
+Anton   nr_extents > 0, so there are attached extents
+Rich    aha, I get it
+Anton   for each extent, release it and throw it away.
+Anton   finally, release the array itself.
+Anton   good. (-:
+        * Anton had forgotten himself (-:
+Anton   that is irrelevant in this context. a base inode is obviously
+	!NInoAttr()
+Rich    yes
+Anton   if there was no space, we need to (re)allocate
+Anton   add 4 pointers
+Anton   allocate and fail grace fully on ENOMEM
+Rich    ok
+Anton   if already allocated, memcpy over and release the old mem
+Anton   set to new mem
+Anton   as before put at end (may be at beginning if nr_extents was zero)
+Anton   i.e. this is the first extent being attached
+Anton   unmapping an extent mft record, we just call the normal unmap function.
+Rich    ok
+Anton   note, how we leave the ntfs_inode of the extent attached to the base
+	inode
+Anton   it is left for ntfs_clear_big_inode to get rid of
+Rich    yes
+Anton   this means repeated calls of map_extent_mft_record will always be very
+	fast except the very first time
+Rich    yeah
+Anton   very performance critical due to ntfs_lookup()
+Anton   ok that is all about mft records and how we deal with them
+Rich    brilliant.  cheers, Anton.
+Anton   the comment above map_mft_record() and the mutex should explain why we
+	don't race with anyone else modifying the contents as we are reading
+	them.
+Anton   np
+Anton   the mutex unfortunately no longer allows multiple processes to read at
+	the same time
+Rich    oh, ok

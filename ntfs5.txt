@@ -1,0 +1,751 @@
+Anton   er, which tree should I cd into?
+Anton   [screen is running now btw]
+Anton   so you can navigate (-;
+Anton   ok
+Anton   I think address space ops is next.
+Rich    ok
+Anton   [following some insane logical order - or not... (-;]
+Anton   right
+Anton   we have covered the file ops where we use the generic_file_read/_mmap
+Rich    yep
+Anton   what generic_file_read does is effectively to loop over the range of
+	the read request in chunks of PAGE_CACHE_PAGE size and call ->readpage
+	for each page.
+Rich    ok
+Anton   what generic_file_mmap does is to install a page fault handler .
+Anton   so when the user tries to read a particular mmap()ed memory region, a
+	page fault occurs (page not present)
+Anton   and then the system calls ->readpage to read in that page
+Rich    I see
+Anton   after that the page is present so the user can just access the memory
+Anton   both boil down to the same thing.
+Rich    ok
+Anton   the fs needs a ->readpage address space operation to support reading
+	using generic_file_ functions
+Anton   so we have ntfs_readpage
+Anton   it receives the struct file and the page we are supposed to fill with
+	data.
+Anton   note the struct page is fully initialized.
+Anton   but the data contents of the page are not initialized to anything.
+Rich    ok
+Anton   in fact just read the comment about the function for a starter.
+Rich    yep
+Anton   ok
+Anton   we check that the page is locked and bug if not
+Anton   if the page is not locked it means anyone could be reading/writing on
+	that page which would be a disaster
+Anton   considering the page doesn't contain valid data yet
+Anton   As an aside, once the contents of the page are uptodate, ->readpage
+	has the responsibility of setting the page uptodate and unlocking the
+	page.
+Rich    ok
+Anton   This tells all people waiting for the page that they can start using
+	it now.
+Anton   now we have multiple cases
+Anton   if the attribute is non-resident / resident / compressed /etc all need
+	special handling.
+Rich    I see
+Anton   Lets cover the resident case first as that is what ntfs_readpage is
+	really involved with.
+Anton   we need the real inode in order to find the attribute in it
+Anton   for attribute inodes, we need to get ->base_ntfs_ino...
+Anton   otherwise it is of course just the inode itself
+Rich    from where will we get requests for attr inodes?
+Anton   ntfs_map_page()
+Rich    ok
+Anton   which calls read_cache_page()
+Anton   e.g. in dir.c::ntfs_readdir()
+Anton   when we read the directory index bitmap
+Anton   which is resident most of the time
+Rich    ok
+Anton   ok, so the usual stuff, map the mft record, search context, find the
+	attribute...
+Anton   get the position and length
+Anton   We have to kmap() the page in case it is in highmem
+Rich    ok
+Anton   We also have to zero any parts of the page which don't contain
+	attribute data.
+Rich    is that expected of us?  or just a courtesy?
+Anton   Expected.
+Anton   The page contents are whatever was left in RAM before we got the page.
+Anton   Not zeroing means exposing stale data in worst case.
+Anton   Now imagine that RAM page was storing your password for whatever
+	reason...
+Rich    oh, I can see the potential for damage
+Anton   yes
+Anton   readpage() operates at page granularity
+Rich    yeah, I was just looking to see if we return the amount of data
+Anton   when we set the page uptodate, we imply that the entire page is
+	uptodate.
+Rich    ok
+Anton   no, there is no amount of data.
+Anton   we need to set the page uptodate otherwise it is interpreted as I/O
+	error.
+Rich    aha
+Anton   i.e. if we leave page not uptodate but we unlock the page we tell the
+	kernel/user that there was an error reading in the page.
+Anton   this is all a bit of clever (or not...) arithmetic to zero only the
+	right region of the page and copy the attribute value into the rest
+Rich    yep
+Anton   this one is important.
+Anton   We are ia32 people so we don't care. But other arch will blow up
+	without this
+Rich    oh right
+Anton   the rule is:
+Anton   if you modify the data contents of a page cache page, you _must_
+	flush_dcache_page()
+Anton   as long as we always obey this rule other arch will be happy with us.
+Rich    ok
+Anton   unmap the page again.
+Anton   all the page is now initialized... set it uptodate
+Anton   unlock the page and return 0 = success.
+Anton   readpage can also directly return -error_code...
+Anton   obviously the page is then expected not to be set uptodate...
+Rich    yeah
+Anton   From now on, every read to this resident attribute will never read
+	NTFS at all.
+Anton   the kernel will satisfy read requests from the page cache itself.
+Rich    good
+Anton   [unless the kernel throws away the page due to low memory]
+Anton   [then we get called again to read it again]
+Anton   ok, now the other cases
+Anton   the attribute is non-resident
+Anton   we only allow unnamed $DATA attributes to be special.
+Anton   (i.e. encrypted / compressed)
+Anton   whether named $DATA attributes can be compressed/encrypted is an open
+	question...
+Anton   I assume no at the moment...
+Rich    I haven't heard any rumours either way
+Anton   yeah, me neither
+Anton   doesn't really matter.
+Anton   if it breaks, it will be fixable with just a few lines of code being
+	changed...
+Anton   So
+Anton   if it is unnamed $DATA,
+Anton   if it is encrypted we return -EACCESS which is exactly what NT4 does.
+Rich    yep
+Anton   One day, we will hopefully call ntfs_read_encrypted_block(page);
+Anton   (-:
+Rich    somehow :-)
+Anton   yes
+Anton   if it is compressed, we call
+	compress.c::ntfs_read_compressed_block(page);
+Anton   we can go through that later/some other time
+Rich    no need, I've read through compress.c recently
+Anton   finally, it is a bog-standard non-resident streambased attribute.
+Anton   [ok, even better. (-: Not sure I remember how the decompression
+	works... I hope I have commented it well enough to be able to remember
+	by reading it]
+Rich    it's only scary, because you decompress directly into an array of pages
+Anton   yes there is that.
+Anton   And hpa/jgarzik wanted me to use an array of source data pages as well
+	but I found that way too ugly/scary...
+Rich    what compressed data in pages -> uncompressed data in pages?  hell
+Anton   yes!
+Anton   quite
+Anton   that would be Code From Hell(TM)
+Rich    indeed
+Anton   ok, now we are indented enough, so we call a different function
+	ntfs_read_block()
+Anton   which is basically a rip-off of the generic block_read_full_page()
+Anton   Ah, I forgot one important detail
+Anton   ntfs_readpage() must never look at the struct file * passed to it
+Anton   Just assume the darn thing is NULL
+Anton   This is because it _really- is NULL when we call it via ntfs_map_page
+	or read_cache_page for that matter
+Rich    er, explain
+Anton   There only is a file if it is userspace initiated i/o, i.e. someone
+	did an open(2) which generated the struct file.
+Rich    oh, I see
+Anton   We don't open files from inside the driver.
+Anton   We access address spaces directly.
+Anton   And they are attached to their inode.
+Anton   Every time a file is opened a new struct file is created and it is
+	made to point at the correct inode.
+Anton   I.e. you can open the same inode multiple times and for each time you
+	get a different struct file.
+Anton   But in the end all of those point to the same inode.
+Rich    ok
+Anton   This is how it is possible that different processes have the same file
+	open and read from different places in that file.
+Anton   Simultaneously.
+Rich    ah, of course
+Anton   Remember what happens when someone reads a file normally:
+Anton   lseek()
+Anton   this sets file->f_pos;
+Anton   followed by read()
+Anton   this uses file->f_pos and updates it as the read progresses.
+Rich    yeah
+Anton   ok
+Anton   of course all this silliness is hidden from us by the nice VFS
+	(generic_file_open, _read, etc)
+Anton   ok, now back to ntfs_read_block().
+Anton   Each inode can have different blocksize.
+Anton   ->i_blkbits
+Anton   we cache it for speed in local variables
+Anton   if it is a new page it doesn't have buffers yet, so we need to create
+	them
+Anton   [also it could be a written to, yet not uptodate page, that has been
+	swapped out and hence stripped off buffers and then swapped in again]
+Anton   [but ignore that for now, probably is just confusing...]
+Rich    ok :-)
+Anton   this is just a sanity check that we really have buffers now...
+Anton   iblock is the first block in the page we need to read.
+Anton   page->index is the position inside the address space in
+	PAGE_CACHE_SIZE units
+Anton   of this page
+Anton   [same thing really]
+Rich    yes, I see
+Anton   lblock is the last allocated block of the attribute.
+Anton   we can't read beyond that because it's not allocated
+Anton   zblock is the last initialized block of the attribute.
+Anton   reading beyond that just returns zeroes.
+Rich    ok
+Anton   self explanatory debug check...
+Anton   ok, now we want to go through all the buffers in the page.
+Anton   Basically at the moment we have each buffer_head covering 512 bytes of
+	the page
+Anton   and the buffers are in a linked list one after the other
+Rich    ok
+Rich    I get it
+Anton   at each loop, we go to the next block in the page (i),
+Anton   as well as iblock.
+Anton   i being the number of the block in the page
+Anton   and iblock being the actual block number
+Anton   and we move to the next buffer_head in the list
+Anton   bh = bh->b_this_page
+Anton   finally, we have finished when we have went around the list once and
+	have come back to the beginning.
+Anton   (the != head comparison)
+Rich    yeah
+Rich    someone mapped the page in before us
+Anton   ok, in case someone did write to parts of the page before
+Anton   not quite
+Anton   this only triggers (AFAIK) when someone has written to parts of the
+	page, without ever having read the page at all
+Rich    oh right
+Anton   Let me just explain a bit how writing works in principle as that
+	explains this a bit better.
+Anton   eg: you open a file, lseek somewhere and then write 1 byte.
+Anton   now, if you only could write to a whole page at once,
+Anton   you would need to read the whole page, then write the one byte to the
+	page, then write the page back to disk
+Anton   right?
+Rich    yep
+Anton   ok
+Anton   so this is not very efficient
+Anton   so instead, when the above scenario happens,
+Anton   only the buffer_head that contains the 1 byte is read
+Anton   the 1 byte is copied into the page
+Anton   then the buffer head is written back to disk later on
+Rich    ok
+Anton   you still need to read in the one buffer_head
+Anton   no way round it
+Anton   this is why small writes are terribly inefficient... the kernel is
+	forced to keep reading, copying, writing...
+Rich    aha
+Anton   but at least you can ignore the rest.
+Anton   so in this situation what do we have:
+Anton   one buffer with uptodate (possibly still dirty - irrelevant for us
+	now) contents
+Anton   but all the other buffers of the page are not uptodate
+Anton   and the page itself is not marked uptodate
+Anton   NOTE:
+Anton   if the page was marked uptodate, the VFS would just return data from
+	the page and ntfs_readpage() would never get called for this page.
+Rich    yeah
+Anton   Which is why I said "no" when you said: "someone mapped the page in
+	before us"
+Anton   If that happened, we would never have gotten here...
+Rich    I see
+Anton   Remember, the VFS locks the page, and only if it is not uptodate will
+	it call ->readpage
+Anton   so it definitely cannot happen that readpage is called for an uptodate
+	page
+Rich    ok
+Anton   [It would actually be a disaster , e.g. if the page contained dirty
+	data and we went and read the page again, throwing away the dirty data
+	in the process...]
+Rich    hmm, yes :-)
+Anton   ok, (I hope) this explains why we need to check if the buffer is
+	already uptodate.
+Anton   and if it is we just skip it
+Anton   The only thing we need to achieve is to get all buffers uptodate, so
+	that we can set the whole page uptodate, unlock the page and return
+	success.
+Anton   So if any uptodate ones are encountered the less work for us. (-:
+Anton   Second, if a buffer is already mapped, i.e. someone has set it up to
+	point to the correct on disk location, we just add it to the array of
+	bufferheads that we will submit for i/o.
+Anton   We call this array "arr"
+Anton   And we use "nr" as the number of buffer_heads in the array.
+Rich    I see
+Anton   Which is of course the number of buffer_heads that we will be
+	submitting for io
+Anton   [Note even if there is a race condition so that we get here when a
+	page is already read in, we will just find all buffers uptodate, and
+	not schedule any io. nr will remain zero and the array will be empty
+	when we exit the do {} while () loop.
+Rich    true
+Anton   The first part of mapping a buffer_head: set its block device to point
+	to the block device of the volume.
+Anton   iblock (current block to read) < lblock (last allocated block) ?
+Anton   i.e. is the read in bounds of allocated data?
+Rich    yep
+Anton   we will retry exactly once.
+Anton   (for each buffer_head)
+Anton   so the first time we set is_retry = FALSE
+Rich    I take it, that's normal to try again?
+Anton   [can I defer the answer to a bit later?]
+Rich    ok
+Anton   we have to convert the 512-byte block into the corresponding Cluster
+	based position
+Anton   vcn and vcn_ofs.
+Anton   vcn_ofs will always be zero for 512 byte clusters of course...
+Rich    of course
+Anton   before entering the loop, we set rl = NULL
+Anton   so we get here and we take the run list lock
+Anton   and we set rl so that we will not get here again and take the lock a
+	second time
+Anton   (that would be a deadlock)
+Anton   if the run list has never been mapped, i.e. this is the very first
+	read of the file, rl will still be NULL!
+Rich    ok
+Anton   in that case just set the lcn to RL_NOT_MAPPED so we go and map it in
+	a bit...
+Anton   normally it will not be NULL
+Anton   so we move forward in the run list element pointer rl until we reach
+	the element holding the "vcn" we want to read
+Rich    ok
+Anton   and once we have that we ask vcn_to_lcn to give us the correct lcn
+Anton   notice how, the next time we go around the do {} while () loop,
+Anton   rl will already be in the correct location so vcn_to_lcn will be
+	really quick
+Rich    yeah
+Anton   instead of having to scan the whole run list from 0 again...
+Anton   which can get very slow once the run list reaches a few hundred kb in
+	length
+Anton   if the vcn_to_lcn returned a real lcn, we can complete mapping the
+	buffer_head
+Anton   point it to the correct disk block
+Anton   it is now a mapped buffer
+Anton   if the buffer head is inside the initialized portion of the attribute,
+	we want to read it from disk
+Rich    ok
+Anton   so we add it to the array
+Anton   if not, we need to zero it
+Anton   now if the lcn was not valid, we need to check if it is a hole
+Anton   if yes, it is ok, we just need to read zeroes.
+Anton   otherwise, if we haven't retried yet, and the lcn is not mapped, we
+	set is_Retry to true
+Rich    ok
+Anton   Now we have to drop the lock.
+Anton   Before we can try to map the runlist part which is missing.
+Anton   map_run_list will take the lock itself.
+Anton   and make sure that someone didn't do the mapping between us dropping
+	the lock here and it acquiring it in a moment.
+Anton   this happens here
+Anton   we take the lock (now for writing as we will be modifying the contents
+	of the runlist)
+Anton   and do vcn_to_lcn()
+Anton   if that doesn't return RL_NOT_MAPPED, someone beat us to it and mapped
+	this run list part
+Rich    ok
+Anton   it's quite a simple function really.
+Anton   (I think (-:)
+Rich    that's fine
+Rich    a question
+Anton   yes
+Rich    for iblocks and zblocks, we set_buffer_mapped, but not for holes within
+Anton   correct
+Rich    can you explain the difference between zblocks (effectively a hole
+	after the file) and holes in the file
+Anton   of course
+Anton   let us assume that data_size (i_size) == 1000.
+Anton   initialized_size == 500.
+Anton   allocated_size == 2000.
+Rich    ok
+Anton   so there is an actual on disk location for everything up to offset 2000.
+Anton   But everything after offset 500 is zero,
+Rich    ok, yep
+Anton   But it _does_ have an allocation on disk.
+Rich    ah, right
+Rich    I see
+Anton   i.e. if someone writes to this, the kernel/ntfs can straight write to
+	the right place.
+Anton   Now a real hole OTOH, doesn't have an allocation.
+Rich    ta, I understand
+Anton   So we need to allocate it before we can write it to disk.
+Anton   (-:
+Anton   Ok, so if the run list map succeeded, we go to lock_retry_remap
+Anton   we take the lock again, and reset rl to the beginning.
+Anton   (the old position is now most likely invalid)
+Anton   and we repeat
+Rich    ok
+Anton   now is_retry is true
+Anton   so we don't try to map _again_
+Anton   that would be silly.
+Rich    yeah, no harm in it, just slow
+Anton   and would just end up in a loop trying and trying till we go blue in
+	the face.
+Anton   the kernel will appear to lockup...
+Anton   and it will for all intents and purposes
+Anton   but that should never happen of course
+Anton   still I felt better having the is_retry to limit retries just in case...
+Anton   if the map failed, we need to set rl = NULL, because we have dropped
+	the lock
+Anton   and we use rl != NULL to mean we have the lock.
+Anton   and rl == NULL we don't have the lock.
+Rich    yes
+Anton   Does the above answer your question as to whether it is normal to retry?
+Rich    yeah, that makes sense
+Anton   ok, cool.
+Anton   if we got here, it means that lcn = ENOENT or EINVAL or some other error
+Anton   or that is_Retry == true but lcn = NOT_MAPPED
+Anton   in any case. we have failed and have no clue what to do.
+Rich    ok
+Anton   we actively set the page error flag.
+Anton   and output an error.
+Anton   this kind of error most likely indicates a corrupt inode (run list is
+	corrupt)
+Anton   now we get here.
+Anton   there are several ways how we get here.
+Anton   1) we fall through on serious error, pageerror is set.
+Anton   2) iblock is >= lblock, i.e. out of bounds read
+Anton   3) we have a hole
+Anton   or 4) it is a non-initialized block
+Rich    ok
+Anton   on error, hole, or out of bounds read, we unmap the buffer.
+Anton   it should be unmapped but make absolutely sure.
+Rich    ok
+Anton   [aside: clear_buffer_mapped is sufficient. bh->b_blocknr = -1UL is
+	just to help us to debug if we need to ]
+Anton   [aside 2: and not only debug but prevent data damage: if we screw up
+	and write to disk this buffer at least we will write it outside the
+	blockdevice so the write will fail at the low level block layer]
+Rich    hmm, true
+Anton   and besides not many people have devices which can hold 2TiB of data.
+	(-;
+Anton   which is where the block is pointing to...
+Anton   As said before, zblocks have a disk mapping, hence we don't unmap those.
+Anton   we need to zero out the page contents of this buffer head, and we need
+	to map the page into low memory to be able to do so.
+Anton   and since we touched the page, we flush_dcache_page()
+Anton   and we unmap it again
+Anton   now the buffer is uptodate
+Anton   so we say so
+Rich    even on error?
+Anton   Yes
+Rich    ok
+Anton   the page is set to error
+Anton   Thinking about it you may be right, perhaps we ought to not do that.
+Anton   But I think this is what block_read_full_page() does.
+Anton   Let's check...
+Anton   Mapping failed, set page error.
+Anton   and set buffer uptodate.
+Anton   Yes,
+Anton   Even on error
+Rich    ok, good
+Anton   (-:
+Anton   ok so we loop around until we have done all the buffer heads
+Anton   if rl is not NULL we are still hanging onto the lock!
+Anton   so drop it now.
+Rich    ok
+Anton   if !nr it means all buffer heads were already uptodate or all errored
+	or whatever...
+Anton   but no io was scheduled
+Anton   Here we check if any errors occurred.
+Anton   If they did, the page error flag is set from above.
+Anton   If not, then we set the page uptodate.
+Rich    ok
+Anton   If there was an error, we set the return code to -EIO to indicate a
+	hard i/o error we cannot recover from.
+Anton   We finally unlock the page and return either 0 success or -EIO.
+Anton   Now, if we did have at least one buffer head that we actually need to
+	read from disk
+Anton   We first need to lock all the buffers we need to read.
+Anton   We cannot start io on any of them yet, because they are not locked yet.
+Rich    ok
+Anton   Bad Things(TM) would happen otherwise. (Will explain later on)
+Anton   Once the buffer is locked, we need to set it up for asynchronous io.
+Anton   We use out own io completion handler
+Anton   and we tell the block layer that this buffer head is being read
+	asynchronously.
+Rich    ok
+Anton   the buffers are ready
+Anton   if they are not uptodate, submit them for io one by one
+Anton   if someone managed to mark them uptodate in the mean time, then just
+	call our completion handler straight away.
+Anton   (this avoids a race condition)
+Rich    I see
+Anton   (in between mapping the buffer/checking for it being uptodate and us
+	locking the buffer any one else could have locked the buffer and read
+	it in)
+Anton   (we can only rely on it not becoming uptodate once we have locked it)
+Anton   Ok.
+Anton   Now we have told the block layer, "please read these buffer heads
+	please"
+Anton   so we return success.
+Anton   0
+Rich    ok
+Anton   note, we do not unlock the page
+Anton   and we don't mark it uptodate
+Anton   we just return.
+Rich    because that's the responsibility of the async handler we just assigned
+Anton   correct
+Anton   And note how the caller will now wait on the page.
+Anton   To give an example, ntfs_map_page...
+Anton   read the page
+Anton   if not an error
+Anton   (synchronous one, i.e. us returning -EIO.)
+Anton   wait for the page to become unlocked
+Anton   check that it has been made uptodate and that no error occurred during
+	the asynchronous reads
+Anton   The advantage of making the caller wait for io completion is when you
+	are reading multiple pages at once.
+Anton   You can ->readpage() all of them
+Anton   and then wait_on_page_locked() all of them after wards.
+Rich    yeah
+Anton   generic_file_read() for example
+Anton   which also does intelligent read-ahead...
+Anton   Ok, the last part of the read process.
+Anton   The async io completion handler
+Anton   get the inode.
+Anton   Note this is how we also get the inode in ntfs_readpage()
+Rich    yes
+Anton   because we cannot use the struct file * in ntfs_readpage...
+Anton   otherwise we could go file->f_dentry->d_inode (or something like
+	that...)
+Anton   but anyway, that was just a random aside
+Anton   the block layer tells us if the buffer head has been made uptodate or
+	not
+Anton   (not == bad block on disk, luser removed the floppy, etc)
+Anton   we need to set the buffer head uptodate.
+Anton   [I am not sure why the block layer doesn't do that but anyway...]
+Rich    ok
+Anton   bh_offset() always works.
+Anton   even on highmem pages!
+Anton   it is the offset of the buffer head within this page.
+Rich    ok
+Anton   this is very neat because we don't need to kmap() the page just to
+	find where this buffer head belongs in the page!
+Anton   If the buffer head crossed the initialized size boundary (a _very_
+	seldom case for obvious reasons)
+Anton   we need to zero out the portion of the buffer head between the end of
+	the initialized data and the end of the buffer head
+Rich    ah, I see
+Anton   Note, we cannot do this inside ntfs_read_block() because the block
+	layer will overwrite our nice zeroes with random crap from disk.
+Anton   When it does the "read sector"
+Rich    anything I should know about KM_BIO_SRC_IRQ?
+Anton   yes, I was just coming to that.
+Anton   we are in an io completion handler.
+Anton   We are in kernel context.
+Rich    aha
+Anton   Even worse, we are in irq context
+Anton   (or bh context, not quite sure)
+Anton   (especially with the irq changes that just happened in 2.5.x I have no
+	idea what is going on any more)
+Anton   In any case, we _cannot_ sleep.
+Rich    I see
+Anton   However, kmap() can sleep.
+Anton   [It may need to allocate memory to make the page visible to lowmem if
+	it is in highmem]
+Anton   This is why kmap_atomic() exists.
+Anton   This is a kmap() which cannot sleep.
+Rich    yep
+Anton   It uses preallocated, per-CPU memory to map the page.
+Anton   The problem with that is that if you do two consecutive kmap_atomic()
+	without kunmap_atomic() in between, the second kmap overwrites the
+	first one!
+Anton   Oops.
+Rich    hmm, that's important to know :-)
+Anton   Yes.
+Anton   This is what the KM_BIO_SRC_IRQ is for.
+Anton   This is the specifier telling kmap_atomic() which preallocated memory
+	to use.
+Anton   So each orthogonal system has to use a different one.
+Rich    hmm, I see
+Anton   For example it is quite possible that NTFS and Networking run nested
+	in each other
+Anton   so NTFS kmaps a page but the block device is on the network and it
+	kmaps another page.
+Anton   oops.
+Rich    ah, interesting
+Anton   hence why ntfs and networking need to use different kmap_atomic()
+	memory.
+Anton   and this is exactly how it works.
+Anton   Each person needing to do kmap_atomic() gets their own KM_* identifier.
+Anton   We use KM_BIO_SRC_IRQ because we are in BIO, read (SRC) IRQ context.
+Rich    ok
+Anton   The block layer has already finished with the read request, so we can
+	reuse the same KM_*
+Anton   I actually asked on #kernel for this and was told to use this.
+Anton   Otherwise I would have most likely made an KM_NTFS_IRQ or something. (-:
+Anton   ok, so we have mapped the page, we zero the appropriate bit of this
+	buffer head, flush, and kunmap_atomic.
+Anton   note a big difference: kunmap() takes the page, kunmap_atomic() takes
+	the address of the page!
+Anton   address of the page data contents I mean
+Rich    ok
+Anton   again, we don't need to care for why any of this happens.
+Anton   If you are interested you can explore the highmem code in the kernel
+	some time...
+Anton   (-;
+        Rich shudders
+Anton   lol
+Anton   If an error occurred, we clear the buffer uptodate flag and set page
+	error.
+Anton   and we emit an error message...
+Anton   We are in irq context, so we have to use _irqsave locking variants.
+Anton   To explain why this lock is needed:
+Anton   First note how it is a private lock just to this function but it is
+	static.
+Anton   I.e. it keeps state across calls.
+Rich    so if the VFS calls this function several times concurrently
+Anton   it will block.
+Anton   on the lock and spin.
+Rich    I see
+Anton   this ensures that we do not encounter bufferheads in inconsistent state.
+Anton   [also note the VFS doesn't call this but the low level block layer]
+Rich    ah yes, of course
+Anton   first, we know we will not be messing with the buffer heads during a
+	concurrent completion event, due to the lock
+Anton   so we can set the buffer head to no longer be marked as undergoing
+	async io
+Anton   and we can unlock it.
+Anton   then we walk all the buffer heads in the page starting at the current
+	one
+Anton   if the current buffer is not uptodate , then we make a note that we
+	cannot set the page uptodate
+Anton   i.e. if _any_ buffer(s) is(are) not uptodate, the page remains not
+	uptodate.
+Rich    ok
+Anton   for any buffers that are already completed or were uptodate to start
+	with (before we submitted them),
+Anton   like the current buffer for example,
+Anton   the async_read flag will no longer be set.
+Anton   so we will just go to the next buffer head.
+Anton   If we find any buffer heads that are still marked under async_read.
+Anton   Those better be locked buffers!
+Anton   [Now you see why we had to lock all buffers and mark them async_read
+	in one loop before we could start submitting them for io with
+	submit_bh()]
+Anton   [in another loop]
+Anton   see:
+Anton   we lock, then set async_read.
+Anton   _always_
+Anton   so if we see async_read, it must be also locked.
+Anton   if it is not, something went _Really_Badly_Wrong_.
+Rich    ok
+Anton   so if it is locked as expected, we know that the page is still busy
+Anton   i.e. there are still buffer heads that are pending io
+Anton   so we are done.
+Anton   unlock and return.
+Rich    ok
+Anton   we will come in again for the next completed buffer_head
+Anton   if it wasn't locked. -> serious bug somewhere...
+Anton   If we get here it means that there are no more async_read buffers left
+	in the page.
+Anton   i.e. the function is running for the last time on a buffer in this page.
+Rich    right, it's all becoming clear, now
+Anton   I.e. we need to complete io on the page and tell people waiting on
+	page locked.
+Anton   Phew. Good. (-:
+Anton   This is quite tricky stuff.
+Anton   And now it should also become clear why we needed the spin lock.
+Rich    yes, indeed
+Anton   If it wasn't there it could be that two buffer heads become complete
+	at same time, and then we complete the page twice. Oops
+Anton   Now comes NTFS specific stuff.
+Rich    back to safer territory
+Anton   (-:
+Anton   If the attribute which this page belongs to is not MST protected, we
+	are all set.
+Anton   if the page_uptodate flag is still set...
+Anton   we start with it set
+Anton   and we only clear if at least one buffer is not uptodate...
+Rich    yep
+Anton   and the page has not been marked as containing errors,
+Anton   we set it uptodate.
+Anton   unlock it and return.
+Rich    and finally the user gets to read something
+Anton   This wakes up people waiting on the page.
+Anton   yes. (-:
+Anton   hm, why the heck do I have this code?!?
+Anton   this would do the same.
+Anton   never mind.
+Anton   let me just make a not to clean this up...
+Anton   ok
+Anton   Now. For a MST protected attribute,
+Anton   before we can let the reader anywhere close to the contents of the
+	page, we need to deprotect it.
+Anton   We take the record size from the index_block_size in the inode.
+Anton   (Remember how I said that for $MFT/$DATA we cheat and set
+	index_block_size to mft_record_size?)
+Rich    yes
+Anton   number of records.
+Anton   [We require that records are <= PAGE_CACHE_PAGE size. We check for
+	this and will never get here if they are not.]
+Rich    aha
+Anton   [The smallest PAGE_CACHE_PAGE size is 4kiB and we have never seen
+	mft_record_size or directory index_block_size greater than 4kiB so we
+	should be safe.]
+Anton   [We can't support bigger records because then we would need to
+	complete io on two or more pages simultaneously in order to apply the
+	fixups to the whole record at once]
+Anton   [And considering we cannot sleep in the io completion handler, i.e. we
+	cannot wait for io on another page to complete, we are screwed.]
+Anton   So lets prey MS doesn't get any strange ideas... (-;
+Anton   for the next ntfs release...
+Rich    yes :-)
+Anton   We kmap_atomic() the page, same principles as before apply.
+Anton   For all records in  the page, apply the fixups.
+Anton   Checking for success.
+Anton   If any errors occur, count them and output an error message.
+Anton   What did we just do?
+Anton   modify the page data contents!
+Anton   -> flush!
+Anton   done!
+Anton   kunmap
+Anton   if the page is already an error page, nothing more to do, just abort
+	by unlocking the page.
+Anton   the caller will check for PageError()
+Anton   If no errors occurred during fixups, and there was at least one record,
+Rich    we aren't setting the PageError in this bit, so if the page is bad,
+	doesn't it make more sense to check before we try and fixup the page?
+Anton   If the page_uptodate flag is still set, finally(!) set the page
+	uptodate.
+Anton   No, because, we want to fixup as many records as possible.
+Rich    oh, ok
+Anton   This is actually all a little flawed.
+Anton   The problem is the PageError() is at page granularity.
+Anton   But a page on ia32 contains 4 mft records.
+Anton   If only one is bad, we really don't want to set the whole page as bad.
+Anton   Which is why I don't set page error here.
+Rich    I see
+Anton   But OTOH we can't set the page uptodate because at least one record
+	contains crap.
+Anton   hm, this needs more careful thought. Lets come back to this detail in
+	abit...
+Rich    ok
+Anton   If there were errors we do set pageerror.
+Anton   and output an error message.
+Anton   unlock and return.
+Anton   And that's it.
+Rich    phew!
+Anton   We now have covered the whole of the VFS from the read-only fs point
+	of view!
+Rich    wow
+Rich    Many thanks, Anton.
+Anton   You are welcome. (-:
+Anton   I think tonight was quite a heavy one.
+Anton   But I hope it made sense...
+Rich    it was getting a little tricky following the async interactions, but I
+	got it eventually
+Anton   oh good.
+Anton   once you sleep over it it will hopefully all fit in place.
+Anton   Remember I explained to you address space ops in one evening.
+Anton   It took me a few months to piece all these things together.
+Anton   (-;
+Rich    yes :-)

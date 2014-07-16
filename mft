@@ -1,0 +1,37 @@
+Aug 05 09:59:35 <AntonA>
+
+btw. The executive summary / emerging locking rules are:
+Never have an mft record mapped when you are about to call one of the following
+functions as they map mft records themselves:
+- ntfs_map_page
+- read_cache_page
+- ntfs_readpage
+- ntfs_read_block
+- ntfs_read_compressed_block
+- map_run_list
+- ntfs_lookup_inode_by_name
+- ntfs_readdir
+- ntfs_lookup
+I.e. you can't call any functions that will map_mft_record the same mft record
+that you have already manually called map_mft_record on.
+This avoids the previous lock recursion and removes the deadlocks.
+And this is what changed throughout the driver.
+It used to be that we map_mft_record() at beginning of a function and then
+unmap_mft_record() at the end of the function.
+Now we only map+unmap in the code where this is really needed and we make sure
+to unmap before calling any of the above.
+So for example in ntfs_read_locked_inode, we now drop the mapping before calling
+ntfs_attr_iget().
+Oh, that is missing from above list, we also cannot call:
+- ntfs_attr_iget
+- ntfs_iget
+- ntfs_read_locked_inode
+- ntfs_read_locked_attr_inode
+- ntfs_read_inode_mount
+I think the list is now complete.
+But it is easy to figure out the list, just think "Is this going to potentially
+map the mft record?" if the answer is yes, then drop your private mapping before
+the call.
+If necessary just map again after the call but at least so far this has never
+been necessary...
+Anyway, a little essay for when you get back. (-:

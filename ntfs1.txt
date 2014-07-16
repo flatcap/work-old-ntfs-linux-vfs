@@ -1,0 +1,394 @@
+Anton   btw. NTFS the driver, a story of kernels, filesystems, and the number
+	42. want to hear some?
+Rich    yeah, sure
+Anton   ok, where do we start.
+Anton   ah, yes, once upon a time...
+Anton   <just kidding>
+Rich    hehe
+Anton   ok, when a fs is mounted in Linux 2.5, the VFS calls the fill_super
+	function (fs/ntfs/super.c::ntfs_fill_super())
+Anton   this is responsible for determining if the file system being mounted is
+	the right type and to setup everything for the driver to work
+Rich    yep
+Anton   and it has to give to the VFS the root directory of the newly mounted
+	filesystem
+Anton   so the VFS can attach that to the mount point
+Rich    ok
+Anton   This happens by setting sb->s_root = d_alloc_root(vol->root_ino)
+Anton   sb is the vfs super_block, vol is the ntfs volume and root_ino is the
+	VFS struct inode for the root directory of the ntfs volume
+Rich    ok
+Anton   what we do in ntfs:
+Anton   allocate a ntfs_volume structure and set it up with defaults
+Anton   parse mount options
+Anton   setup block size to 512
+Anton   read the boot sector
+Anton   parse it
+Anton   read_ntfs_boot_sector does the reading
+Rich    yep
+Anton   and it uses the backup bootsector if necessary/available
+Anton   and if on_errors=repair is set it will even repair the primary
+	bootsector from the backup.
+Rich    ok
+Anton   parse_ntfs_boot_sector does, surprise surprise, parse the boot sector
+	(-:
+Anton   and setup the ntfs_volume (I always call it vol, and the vfs super_block
+	I always refer to as sb)
+Anton   using the parsed values
+Rich    ok
+Anton   we then setup sb->s_magic and sb->s_maxbytes
+Anton   the first is just to tell the kernel what fs type this superblock is
+Anton   and the second is very important when the kernel (and ntfs) check if a
+	file is too big
+Anton   MAX_LFS_FILESIZE which we use is defined somewhere...
+Anton   ctrl+]
+Anton   hehe
+Anton   nice
+Anton   include/linux/fs.h
+Rich    already there
+Anton   so on 64bit arches it is 2^64-1 and on 32-bit arches it is 2^32-1
+Anton   er, sorry
+Anton   2^48-1
+Anton   er, sorry
+Anton   2^42-1
+Anton   that's it (-:
+Anton   basically it is because Linus refuses to have page->index 64-bit on
+	32-bit arches
+Rich    oh, ok
+Anton   which means that the page cache cannot index more than 2^32 pages
+Anton   and since a page is 2^10 (4096) bytes big
+Rich    yep
+Anton   the maximum file size that fits in the page cache before the index rolls
+	over is 2^42-1
+Anton   very bad things happen if a file is larger...
+Anton   especially on write...
+Anton   you just start writing to the beginning of the file. oops
+Anton   So s_maxbytes is something very important to keep in mind...
+Anton   When we work on write support.
+Anton   or we will eat data for breakfast.
+Anton   anyway, getting back to the mount procedure...
+Rich    that's going to be a common occurrence :-)
+Anton   hehe
+Anton   we now have a bit of leftover debugging code (we poison vol->mft_ino)
+Anton   vol->mft_ino is used for the struct inode of the $MFT system file.
+Anton   obviously we need to have this file open at all times while the volume
+	is mounted
+Rich    yes
+Anton   we set the super operations to ntfs_mount_sops which are a limited set
+	of operations
+Anton   and they contain a read_inode() method
+	(fs/ntfs/inode.c::ntfs_read_inode_mount())
+Anton   this method is a big kludge which we need in order to startup the volume
+Rich    ok, I see
+Anton   obviously we cannot use our normal functions yes, because we haven't
+	loaded $MFT, the classical catch-22...
+Rich    yeah
+Anton   so we do an iget(vol->sb, FILE_MFT);
+Anton   the VFS tries to find the inode with inode number FILE_MFT
+Anton   it doesn't find it obviously
+Anton   so it calls s_op->read_inode()
+Anton   which is our ntfs_read_inode_mount().
+Rich    but would it find it if this was the second person mounting the volume?
+Anton   each mounted file system has its own super_block
+Anton   if a second person mounts the _same_ volume then the VFS performs the
+	mount internally
+Rich    oh, ok
+Anton   ntfs_fill_super is never called
+Anton   fs/ntfs/inode.c::ntfs_read_inode_mount():
+Anton   initializes the ntfs_inode part of the inode
+Anton   [note in 2.5.x there is one structure struct inode and one ntfs_inode
+	but both are kept inside the same memory structure]
+Anton   [ntfs_big_inode]
+Rich    yep, I remember
+Anton   [when VFS needs to get a struct inode it calls NTFS s_op->alloc_inode()
+	to give it one and later ->destroy_inode to get rid of it]
+Anton   ok
+Anton   Ok, so we setup the ntfs_inode part by hand
+Anton   we know it will be nonresident, and mstprotected
+Anton   and the attribute type is AT_DATA, unnamed and 0 length
+Anton   now we cheat a bit
+Anton   we set the index_block_size{,bits} to the mft_record_size{,bits}
+Anton   basically all MstProtected ntfs inodes need to have the fixups applied
+	on read/write
+Anton   Since most are directory index allocations and just $MFT/$DATA is the
+	odd one out
+Anton   we just pretend $MFT/$DATA is a directory index (-;
+Rich    aha
+Anton   ok?
+Rich    yep, I see
+Anton   ok
+Anton   when we read data if NInoMstProtected() is true we use
+	ni->index_block_size{,bits} to figure out the size of the NTFS records
+	that need fixing up
+Anton   ok
+Rich    ok
+Anton   now we set mft_ino = the $MFT/$DATA struct inode
+Anton   vol->mft_ino that is
+Anton   we need that for mft.c::map_mft_record()
+Rich    ok
+Anton   we do some sanity checking now
+Anton   and then we read the mft record using vol->mft_lcn
+Anton   and we fix it up
+Rich    ok
+Anton   We now have a todo here: when that fails we really ought to try to read
+	the mft mirror instead... but that is left for some other time
+Anton   we copy the sequence number from the mft record
+Anton   we cache those in ntfs_inode->seq_no
+Anton   so we can do sanity checks
+Rich    ok
+Anton   (e.g. to see if directory contents match the actual file or whether the
+	two are out of sync)
+Rich    I see
+Anton   we set the address space operations for the $MFT/$DATA inode (vi)
+Anton   Now we can really read data from $MFT!
+Anton   we get a search context
+Anton   we need to get the attribute list first
+Rich    ok, familiar stuff
+Anton   yep
+Anton   for all inodes which have an attribute list, we copy the attribute list
+	attribute value into the ntfs_inode structure
+Anton   we use this as a massive speed optimization
+Anton   (ni->attr_list)
+Rich    ok
+Anton   Now I am not sure about something in NTFS so we have quite a lot of code
+	possibly for nothing.
+Anton   Read the FIXME, that should explain it...
+Rich    ah, you're hoping the first part of $DATA attr will always be in record
+	0
+Anton   I don't know if it is guaranteed that the first extent of the $MFT/$DATA
+	attribute will be in mft record 0.
+Anton   yes
+Anton   I am not sure if this is always the case or not...
+Anton   If not the current algorithm will fail.
+Anton   And give us a pretty error message so we know we need to do some work
+	there. (-;
+Rich    I can't see how you'd get the file fragged enough to make the attr list
+	big enough for the data to not fit in mft[0]
+Anton   yes, well you never know...
+Anton   I thought the bit of extra code to make sure is a good thing, just in
+	case.
+Rich    fair enough
+Anton   The kernel will actually panic() if this case happens without it being
+	caught by us so it is worth checking...
+Anton   What we do now is to read in all extents of the $DATA attribute
+	sequentially and decompress the run list from each and merge them.
+Rich    ok
+Anton   The driver assumes that $MFT/$DATA is always completely run list mapped.
+Anton   if it finds it is not it panic()s.
+Rich    ok
+Anton   we have a bit of special casing inside the loop
+Anton   when we are in the first extent some magic happens because we now know
+	the full size of the attribute and other things which we can use for
+	sanity checking,
+Rich    do you know if M$ actually test for all these conditions?
+Anton   so we setup the ntfs_inode with them.
+Anton   no idea.
+Anton   probably not.
+Anton   it slows down stuff.
+Anton   I am testing so that if they are valid the driver aborts with an error
+	rather than messing up later when it finds a situation we haven't
+	considered in the code...
+Anton   On write this is important so we don't trash data.
+Rich    that's fair enough.  just curious
+Anton   (-:
+Anton   we now also setup vol->nr_mft_records at this time which is important to
+	keep in mind
+Anton   (especially when $MFT is extended this needs updating, too)
+Rich    ok
+Anton   we use this so we know how many inodes there are
+Anton   we then switch to the real super operations which are complete and no
+	longer have the ->read_inode() kludge.
+Anton   and we now directly call ntfs_read_locked_inode().
+Anton   this sets up the inode completely. we could do all of this here by hand
+	instead
+Anton   but that would be just duplicating code unnecessarily.
+Anton   the only bad thing is that ntfs_read_locked_inode() needs to check
+	whether it is running now and if so needs to not do somethings...
+Anton   e.g. reinitialize the ntfs_inode structure... that would kill all our
+	setup so far.
+Anton   we then have to do some fixing up of what  ntfs_read_locked_inode did
+Rich    ok
+Anton   i.e. change i_[ug]id
+Anton   , etc.
+Anton   and reset the inode, file and address space ops to the mft ones.
+Anton   we don't want someone calling open(2) on $MFT after all...
+Rich    ok
+Anton   and even less someone calling read(2), not to mention write(2)...
+Rich    hehe
+Anton   ok, so we loop and read map the run lists of all the $DATA extents.
+Anton   some sanity checks and we return
+Anton   iget() returns to us the initialized inode.
+Rich    and we're back in fill_super
+Anton   yes. we check it is ok and that it equals to what we put in vol->mft_ino
+Anton   all is ok so we carry on. At this point we have full access to
+	$MFT/$DATA and can call map_mft_record() and friends.
+Anton   We need to setup the compression engine if it is not setup yet.
+Anton   We use a NTFS driver global lock
+Anton   ntfs_lock, a simple semaphore (mutex)
+Anton   if there are no compression users, we allocate the compression buffer
+Anton   we keep a reference count of how many mounted ntfs volumes there are and
+	of how many compression enabled ones there are
+Anton   then we generate the default upcase table if this is the very first
+	mount
+Rich    ok
+Anton   and release the lock.
+Anton   we then load the remaining system files (this includes opening the root
+	directory)
+Anton   [we will get back to this in a moment]
+Anton   and assuming that was ok
+Anton   we attach the root directory to the super block.
+Rich    could we delay creating the compression buffer until we actually find a
+	compressed file?
+Anton   we could but I don't see the point. It just means we need to check for
+	the thing being allocated every time a new compressed page is read
+Anton   which is a hell of a lot of checks
+Rich    ok
+Anton   assuming all is ok
+Anton   we take the ntfs_lock again
+Anton   and free the default upcase table if noone is using it.
+Anton   [this never happens, everyone usually uses the default upcase table]
+Anton   [at least we haven't found any volume with a different upcase table in
+	it]
+Anton   we release the lock and return to the VFS with 0/success.
+Anton   The volume is now mounted and fully operational.
+Rich    brilliant
+Anton   If anything failed along the way there is a lot of cleanup...
+Anton   One important point in the cleanup is that we need to
+	invalidate_inodes()
+Anton   otherwise there are inodes left around after the failed mount and if the
+	user retries the mount after fixing the problem
+Rich    ok
+Anton   our read_inode functions are never called
+Rich    I see :-)
+Anton   yes. oops...
+Anton   now for some details
+Anton   during  ntfs_read_inode_mount()
+Anton   we looped over all the pieces of $MFT/$DATA using ntfs_lookup(0
+Anton   obviously if $MFT is fragmented it ntfs_lookup() will map further extent
+	mft records
+Anton   the only reason this doesn't blow up at this stage is that we are
+	mapping the extents in sequence and is it a fair assumption that each
+	new extent will be mapped by one of the previous extents run list
+	fragments.
+Anton   if that is not the case it would be impossible to mount the volume.
+Anton   if we are not careful when doing the write code this could be a mistake
+	we make when allocating $MFT records for $MFT itself...
+Rich    yeah, likewise the example before with mft[0] NOT containing the
+	beginning of the $DATA attr
+Anton   exactly.
+Anton   but that could actually happen
+Anton   because it _seems_ that $MFT/$DATA _always_ has the first 16 mft records
+	together
+Anton   so it could be that for example record 0xf contains the first $DATA
+	extent
+Anton   we would still know where it is
+Anton   but I am not sure if this can happen
+Anton   it depends on the MS specifications/things they implemented in the
+	windows driver.
+Rich    indeed
+Anton   ok, now to get back to load_system_files()
+Rich    ok
+Anton   we read the $MFT/$BITMAP attribute inode
+Anton   we need a little aside:
+Anton   we have two types of inodes in the driver:
+Anton   "normal" inodes
+Anton   which are directories and files
+Rich    and attribute
+Anton   i.e. things which correspond to an mft record
+Anton   yes
+Rich    ok, go on
+Anton   ok
+Anton   the attribute ones correspond to attributes instead of inodes
+Anton   when we want a real inode, we call ntfs_iget()
+Anton   when we want an attribute inode we call ntfs_attr_iget()
+Rich    or alternatively "normal" inodes are just attribute inodes of type $DATA
+	or $INDEX_ROOT
+Anton   $DATA, unnamed and $INDEX_ROOT, name $I3O
+Rich    specifically :-)
+Anton   $DATA, named or $INDEX_ROOT, name != $I3O would be attribute inodes
+Anton   we could in theory make everything attribute inodes and just have the
+	"real inode" contain an attribute inode for $DATA, etc
+Anton   but there is no point in doing that, just wastes resources and is
+	slower...
+Rich    ok
+Anton   we always keep $MFT/$BITMAP open and connected to vol->mftbmp_ino;
+Anton   we then open the mft mirror
+Anton   again a TODO: need to make sure the mirror matches the mft
+Anton   and if not refuse a write mount
+Anton   or repair the volume or whatever...
+Rich    ok
+Anton   For now we go on...
+Anton   load and initialize the upcase table.
+Anton   there we just read $UpCase and compare it to default_upcase.
+Anton   If they match we discard $UpCase and just use the default
+Anton   otherwise we use $UpCase.
+Anton   then we open $Bitmap and calculate the number of clusters
+	vol->nr_clusters.
+Anton   This would only need to change if we ever support "hot-resize"
+Rich    ah, yes
+Anton   then we get $Volume and setup the volume version from it
+Anton   note we currently do not verify the version, we just mount anyway.
+Anton   again we should check it and at least change to a read-only mount if it
+	is something we don't know about
+Anton   then we open the logfile and close it again. we will need to overwrite
+	it with -1 once we implement writing...
+Anton   same with $AttrDef. We should parse it but for now we just close it
+	again.
+Anton   then we open the root directory
+Anton   if on NTFS 1.x we are done
+Anton   on ntfs 3.x we open the $Secure file for future use
+Anton   and we open the $Extend system directory
+Rich    ok
+Anton   as a TODO: we need to either here or somewhere later on open $Quota,
+	$UsnJrnl, $Reparse and such things... and deal with them.
+Anton   and that is that.
+Rich    excellent
+Anton   we return to fill_super.
+Anton   So we have a mounted volume, vol->* is setup.
+Anton   Need to stop for now.
+Rich    thanks for that, Anton.
+Rich    it's been a great help
+Anton   Are you ok with the actual driver registration/unregistration?
+Anton   no problem.
+Rich    yeah
+Anton   there will be more chapters to come. (-:
+Anton   ok
+Rich    I'm going to disappear for food, now
+Rich    cheers
+Anton   ok
+...
+Anton   an addition from previous ntfs chitchat: you asked what
+        
+	        happens on mounting multiple times. effectively the reference
+		count on the
+        
+	        super block is increased. and then with each umount it is
+		decreased again.
+        
+	        when it reaches zero, ntfs_put_super() is called. This closes
+		all open system
+        
+	        files (like $MFT, etc) releases memory and returns. The VFS then
+		destroys the
+        super block and the mount is gone.
+Rich    ok, I think I'd have guessed that. ta.
+Anton   the only things left in super.c that need mentioning are
+        
+	        ntfs_remount which is called every time someone performs a mount
+		-o remount on
+        the volume.
+Anton   at the moment that is pretty empty but will need to grow
+        
+	        when we have write. Because switching from RO to RW and vice
+		versa is not
+        trivial...
+Rich    ok
+Anton   and the final thing is ntfs_statfs which is called when
+        someone does "stat -f"
+Anton   it just fills in the stat structure
+Rich    ok
+Anton   and it uses two helpers one to get the number of free clusters and
+        the other the number of free mft records
+Anton   that is super.c done (-:
+Rich    cheers :-)
+

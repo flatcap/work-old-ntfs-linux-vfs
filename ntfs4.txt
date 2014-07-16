@@ -1,0 +1,333 @@
+Rich    ok, ready
+Anton   to actually allow file accessing, we need file operations.
+Anton   file.c
+Anton   because the VFS is cool, we can just reuse the generic lseek, read,
+	and mmap VFS helpers
+Anton   those handle intelligent readahead, and all the bells and whistles and
+	save us a lot of code.
+Anton   (non-trivial code I might add)
+Rich    yeah
+Anton   only for opening files do we have little wrapper for the VFS generic
+	open function.
+Anton   This is again just for 32bit architectures
+Anton   analogous to ntfs_dir_open() if you remember it
+Anton   to make sure the file size does not exceed the page cache limit.
+Anton   (page->index overflows)
+Rich    ok
+Anton   I know that this is a bit daft.
+Anton   It would be better to open the file and just to not allow reading any
+	further than the limit.
+Anton   But it is _much_ easier this way.
+Anton   We know in all our code that it is _impossible_ to meet too large
+	files, we never would have allowed them to be opened in the first
+	place.
+Anton   So the only thing we need to be careful about is when extending the
+	length of a file.
+Rich    ok
+Anton   And guess what, generic_file_write does it for us. (-:
+Anton   of course we don't use generic_file_write yet, we are read-only...
+Rich    ok :-)
+Anton   there is the check
+Rich    nice
+Anton   it sends a signal to the process and returns -EFBIG;
+Anton   so we are all nicely covered by simply refusing to open too large files.
+Anton   we know we can't have made them...
+Anton   must have been windows...
+Anton   you know our memory helpers?
+Rich    I've seen them, yes
+Anton   using vmalloc() or kmalloc() depending on size
+Rich    yeah
+Anton   ok.
+Anton   pretty trivial once #kernel folks tell you that VMALLOC_START is a
+	magic address you can use to find out if a pointer is vmalloced() or
+	kmalloced()
+Anton   the time stuff is no news for you either I would guess?
+Rich    old news :-)
+Anton   (-:
+Rich    looks familiar :-)
+Anton   our gcc magic which you came up with (-:
+Anton   the run list in the kernel has a rw semaphore to protect it
+Rich    locking at the run_list level
+Anton   yes
+Anton   it is not nice to have someone reading the runlist while someone else
+	is mapping a new extent into it and reallocating memory and freeing
+	the original...
+Anton   that looks familiar, doesn't it (-:
+Rich    yes, strangely :-)
+Rich    told you I liked spotting patterns :-)
+Anton   I am still amazed at this stuff and how you managed to come up with it.
+Anton   brilliant
+Rich    ta :-)
+Anton   that's our volume
+Anton   we point to the vfs super block.
+Anton   we keep the number of blocks on the device.
+Anton   some flags
+Anton   just show system files and case sensitive mount options for the moment
+Rich    all fairly self-explanatory
+Anton   cool
+Anton   for later...
+Anton   once we start writing.
+Rich    yep
+Anton   goes with these
+Rich    yep
+Anton   and two locks, one for mft bitmap one for cluster bitmap
+Rich    ok
+Anton   copy of the volume flags.
+Anton   and the ntfs version.
+Anton   and that's it
+Anton   as you say rest is self explanatory
+Anton   only define sysctls if the kernel is compiled with them...
+Anton   and we have debugging enabled.
+Rich    yep
+Anton   otherwise we just return success
+Rich    ripped from the old driver
+Anton   this is just sysctl gobbledygook, pretty much
+Anton   yes,
+Anton   but cleaned up and with corrected ifdefs.
+Anton   I hope...
+Rich    aha
+Anton   e.g. the ifdef PROC_FS
+Anton   is important
+Anton   but I never actually tried compiling without /proc support
+Anton   but from what I read about sysctl core core and proc core code I think
+	I am correct.
+Anton   otherwise just register/deregister us with the kernel core.
+Rich    yeah
+Anton   I think layout.h needs no comments (-:
+Rich    no
+Anton   inodes.
+Anton   loads of state bits.
+Rich    ok
+Anton   I think self-explanatory?
+Rich    yeah
+Anton   functions to manipulate them.
+Anton   the big inode containing both the ntfs_inode and the struct inode
+Rich    ok
+Anton   Al Viro wants it to look like that including the "vfs_inode" in the
+	name btw.
+        Anton shrugs
+Anton   whatever
+Rich    hmm
+Rich    converters
+Anton   yep.
+Anton   VFS_I is obvious
+Anton   since we have the vfs_inode in the structure...
+Anton   NTFS_I is why Al Viro (I think) wanted this layout for the FS specific
+	(big) inodes.
+Anton   I didn't come up with the list_entry.
+Rich    use of "list_entry" is quite devious
+Anton   I copied it from him.
+Anton   Yes, but it does make it clean.
+Anton   hiding the complicated pointer maths underneath
+Anton   but I agree it is an abuse of list_entry...
+Anton   I never even tried to verify that this is correct, I trust Al on that
+	(-;
+Rich    if they had a generic name for the ntfs_inode you wouldn't need the
+	dodgy cast either
+Anton   True.
+Anton   but it doesn't matter that much. Once the functions exist you never
+	again need to look at them... (-:
+Rich    yeah
+Anton   ok the inode.
+Anton   we keep i_size inside the vfs inode, no point in copying it.
+Anton   we do keep the other sizes cached in ntfs_inode though.
+Rich    ok
+Anton   we also keep the inode number and the mft sequence number
+Anton   even though we have ->i_ino and ->i_generation
+Anton   this is because of extent inodes which are pure ntfs_inode without a
+	vfs struct inode.
+Rich    ok
+Anton   [but we get to those beasts later]
+Anton   then we have a reference count for us.
+Anton   a pointer to the volume
+Anton   the attribute of this inode
+Anton   together with a run list for it
+Anton   then we have the mft mapping stuff.
+Anton   a lock.
+Anton   a reference count
+Anton   a cache of the page containing the mft record
+Anton   and the offset in the page
+Anton   these values are never to be touched outside mft.c
+Rich    ok
+Anton   They are just "magic" for map_mft_record() and friends.
+Anton   then we have the cache attribute list
+Anton   with a size and a run list if it is non-resident
+Anton   if a directory (or $MFT/$DATA or any other MST protected attribute)
+Anton   we have the fixup record size in index_block_size.
+Anton   and _bits.
+Rich    ok
+Anton   [remember the cheat I mentioned before? so we can use only one read
+	page for all of them]
+Rich    yes
+Anton   then only for directories, do we have the bitmap attribute inode, and
+	the index allocation VCN size.
+Rich    yep
+Anton   Then we have compressed files, so we have compressed size, block size
+	and bits and block clusters.
+Anton   Finally we have the stuff for extent mft records and attribute inodes.
+Rich    ok
+Anton   a lock
+Anton   just a mutex now.
+Anton   no point in r/w locking.
+Anton   nr_extents tells us what is going on
+Anton   0 = nothing attached
+Anton   -1 = this is an extent mft record inode
+Anton   base_ntfs_ino points to the ntfs_inode of the base mft record
+Anton   ALSO
+Anton   -1 = this is an attribute inode (if NInoAttr() is true)
+Rich    ok
+Anton   and base_ntfs_ino points to the "real" inode
+Anton   if > 0, this is a base inode, with attached extent mft records.
+Anton   we find those in the extent_ntfs_inos array.
+Anton   that's inodes
+Anton   that is self-explanatory (-:
+Rich    yeah
+Anton   those are familiar
+Rich    yep
+Anton   and all those too
+Rich    yeah
+Anton   just the header file
+Anton   a helper to initialize run lists.
+Anton   use it (-:
+Anton   the search context.
+Rich    ok
+Anton   It contains the current mft record (mrec), the current attribute
+	record (attr)
+Anton   note attr points into mrec
+Rich    yep
+Anton   is_first if true means find THIS attribute
+Anton   if false means find the next attribute
+Anton   then the ntfs_inode to which mrec belongs
+Anton   ntfs_ino.
+Anton   Then for attribute lists we have more fields:
+Anton   the current attribute list entry (al_entry)
+Anton   the base ntfs inode, mft record and current attribute.
+Rich    ok
+Anton   obviously all those are only used when the context describes and
+	attribute + mft record which is not in the base mft record.
+Rich    yep
+Anton   then we have to cache the base record somewhere, and that's base_*
+Anton   last header
+Anton   some ntfs specifics...
+Anton   externals for all the slab caches and operations which are not static.
+Rich    ok
+Anton   p2n() is to interchange pointers and values
+Anton   for comparison purposes.
+Rich    yeah
+Anton   then NTFS_SB
+Anton   simple, since it is just attached kmalloc()ed memory to the superblock
+	at u.generic_sbp.
+Rich    yeah
+Anton   ntfs_unmap_page(), simple, kunmap() the page
+Anton   and release it (it is a page cache page).
+Anton   the kmap()/kunmap() is needed to access pages which are in highmemory.
+Anton   [you are familiar with this?]
+Rich    I wasn't, no
+Anton   ok, basically think 32-bit
+Anton   Our cpus can address 4GiB of RAM with 32 bits
+Anton   but what if you have 16G of RAM?
+Anton   that's called highmem
+Rich    ok
+Anton   if something is outside what the cpu can see, you need to "move it
+	inside"
+Anton   that's what kmap() does
+Anton   on a non-highmem box, kmap() == page_address()
+Rich    I see
+Anton   Once you have done a kmap() on a page, you can then use page_address()
+	on it.
+Anton   Once you are done you kunmap() the page.
+Anton   which is a NOOP on non-highmem boxes.
+Anton   and deep vodoo magic , just like kmap() on highmem boxes.
+Anton   I don't know how it works.
+Rich    ok :-)
+Anton   This stuff is scary. (-;
+Anton   Fortunately we don't need to care how it works.
+Anton   so here is ntfs_map_page().
+Anton   basically it takes an address space and and index (offset into address
+	space in units of PAGE_CACHE_SIZE)
+Anton   it uses the generic read_cache_page, waits on the page, kmap()s it so
+	we can from now on simply use page_address()
+Anton   and we return the page.
+Rich    ok
+Anton   On error we unmap the page and return -EIO.
+Anton   read_cache_page() does the magic of looking up the index in the page
+	cache of this address space.
+Anton   if the page is there it just hands it to us (with an incremented
+	reference count)
+Anton   otherwise it calls the address spaces' ->readpage method.
+Anton   which reads the page from backing store.
+Rich    aha
+Anton   this is how generic_file_mmap and generic_file_read work, too
+Anton   they look for the data the user wants in the page cache
+Rich    ok
+Anton   of the address space of the inode of the file
+	(inode->i_mapping->a_ops->readpage)
+Anton   and if not there they call readpage.
+Anton   which is why to implement reading files , we _only_ need to implement
+	a readpage method. and that's it.
+Anton   the kernel does the rest
+Rich    nice
+Anton   yep (-:
+Anton   ok, some more global externs.
+Anton   and that's it.
+Anton   yes, nothing left I think in header files.
+Rich    ok
+Rich    cheers
+Anton   and 6 files left to go through.
+Anton   my brain is getting tired, how about you?
+Rich    I'm thirsting for beer, after all that thinking :-)
+Anton   one simple file more?
+Anton   ok (-: we stop here then
+Rich    ok, one more file
+Rich    if you wish
+Anton   ok, then, mst.c
+Anton   the is the quickest
+Anton   ok, mst.c
+Rich    this should be quick :-)
+Anton   yep, I think so too ... post_read_mft_fixup.
+Rich    remove the mst protection
+Anton   just uses size as the record size and does the fixup removals.
+Anton   yep
+Anton   as a minor point, we return 0 if we think there are no fixups to be
+	applied
+Anton   and 0 = success.
+Anton   not quite sure how good an idea that is
+Rich    hmm, not sure
+Anton   anyway, we apply the fixups
+Anton   but before we even start
+Anton   we just go through and check that no incomplete transfers exist.
+Anton   if we find any return -EINVAL;
+Rich    ok
+Anton   [for lack of better return value... if you have a better one...]
+Anton   and we set the magic to BAAD.
+Anton   so the caller can check for that...
+Anton   then the fixups
+Anton   and return success
+Anton   pretty straight forward really
+Rich    yeah
+Anton   pre_write is the same in reverse
+Anton   we create the fixups
+Anton   so we protect the record
+Anton   we return error now if we fail for any reason.
+Rich    ok
+Anton   e.g. we refuse to touch BAAD records, HOLE records and anything that
+	looks corrupt
+Anton   and we make sure we don't ever end up with a fixup value of 0xffff,
+	and 0...
+Rich    yep
+Anton   and that's that
+Anton   post_write
+Anton   is just cut and paste from post_read
+Anton   except there are no sanity checks at all
+Rich    ok
+Anton   if pre_write succeeded this is guaranteed to succeed, too.
+Anton   so we just want to get rid of the fixups.
+Anton   as quickly as possible
+Rich    yeah
+Anton   5 files left (-:
+Rich    tomorrow
+Rich    cheers
+Anton   yes, I've had enough. (-: my tongue needs watering
+Anton   or is that my fingers? (-;
+Rich    :-)
+

@@ -1,0 +1,659 @@
+Anton   do you want to read the comment
+Rich    yeah
+Rich    ok
+Anton   right, first a bit of principles
+Anton   when you have a mmap(2)ed file
+Anton   on first access to a mapped page (irrelevant if user is reading or
+	writing) you get a pagefault
+Rich    which causes us to read the actual data
+Anton   which causes ->readpage to be called which fills the page with data
+	and does SetPageUptodate()
+Anton   yes
+Rich    ok
+Anton   So we always start with a clean, uptodate page.
+Anton   Further, the ntfs_readpage() may have gone through ntfs_read_block()
+Anton   in which case the page also will have buffers (page_has_buffers() ==
+	true)
+Rich    ok
+Anton   for resident or compressed files it will not have buffers.
+Anton   Now the user does memcpy() to the memmapped file's memory buffer.
+Anton   The page is set dirty.
+Anton   (by the kernel)
+Rich    yeah
+Anton   Note set_page_dirty() also calls ->set_page_dirty() (an address space
+	operation)
+Anton   if it is implemented
+Rich    ok
+Anton   aops
+Anton   if exists call it as the _only_ thing.
+Anton   if it doesn't exist
+Anton   see the comment
+Anton   it calls __set_page_dirty_buffers
+Anton   (skip the comment that is twice as long as the function for now)
+Anton   if page_has_buffers() mark all buffers dirty
+Anton   then set the page dirty
+Rich    ok
+Anton   if there are no buffers, it just sets the page dirty
+Anton   so this is fine for us (for now)
+Anton   [once we start with MstProtected attributes this will no longer work,
+	but forget about it for now]
+Anton   To balance the buffers version there is also a version that only sets
+	the page dirty
+Anton   and completely ignores any buffers
+Anton   This part of the comment is worthy of note.
+Rich    this will come into play when only one buffer (MFT record) is dirty
+Anton   yes and for other things, too.
+Anton   for now irrelevant but just note that this also marks the inode dirty
+	but only the pages.
+Anton   [I don't want to give you too much at once so lets forget about inodes
+	for now.]
+Rich    ok
+Anton   ok so once a page is dirty, the VM will eventually decide it should be
+	written to disk.
+Rich    yes
+Anton   actually another aside:
+Anton   when the page is set dirty because of mmap(2), as you just saw
+Anton   there are two situations:
+Anton   1) no buffers -> page is set dirty ; done
+Anton   2) buffers -> _all_ buffers are set dirty; page is set dirty; done
+Anton   however, because of in future appearing prepare/commit_write which
+	form the write(2) code path
+Anton   we also have the possibility of:
+Anton   3) buffers -> some are dirty
+Rich    ok
+Anton   for case 1) we know all of the page is dirty
+Anton   but we have to be careful not to write beyond i_size.
+Anton   for 2) all buffers are dirty, so in effect all the page is dirty,
+	again, i_size comment applies
+Anton   for 3) we have to obey the dirty state of the buffers and only write
+	the dirty ones
+Rich    yes
+Anton   again obeying i_size.
+Anton   ok.
+Anton   now to ntfs_writepage() (-:
+Anton   the page better be locked or there are race conditions to death...
+Anton   this is guaranteed by the kernel
+Anton   it is possible that someone is truncating the file at the same time as
+	us writing the page
+Anton   in that case it is possible that we find a dirty page which no longer
+	exists in the file (i.e. it is fully outside i_size)
+Rich    I see
+Anton   basically this is a race condition.
+Anton   so if we find that this is the case, we know what to do.
+Anton   unlock the page, and return i/o error.
+Anton   once that's over we now know that the page is either somewhere inside
+	the file or it straddles i_size, i.e. only part of the page is valid
+	for writing.
+Anton   Let's do the resident attribute case first...
+Anton   resident attributes don't have buffers (cf. ntfs_readpage)
+Rich    ok
+Anton   and if there are no buffers, we better have an uptodate page
+Anton   otherwise we are writing invalid data.
+Rich    sorry?
+Rich    not uptodate, dirty
+Anton   yes, that is not a valid combination
+Anton   (when there are no buffers)
+Rich    ah, ok
+Anton   why should you set a page dirty if it doesn't have valid contents?
+Anton   it doesn't make sense
+Anton   if ->readpage has run it will set the page uptodate.
+Rich    yeah
+Anton   (mmap case -> always true)
+Rich    then you write to it and what state is in then?
+Anton   uptodate & dirty
+Rich    aha
+Anton   that means the contents in memory are valid
+Rich    ok, I understand
+Anton   but that they need to be written out because the disk is "out of date"
+Anton   ok
+Anton   skip the comment for now
+Anton   this now works analogous to ntfs_readpage.
+Anton   we take the base inode 
+Anton   grab the mft record (we now hold the mrec_lock mutex)
+Anton   find the attribute we are writing to
+Anton   find the starting position (this will really always be zero...)
+Anton   (resident attributes are very small)
+Anton   get the attribute length
+Anton   it better match the current i_size
+Anton   otherwise we have screwed up...
+Rich    ok
+Anton   [in an not yet written part of the write code (-:]
+Anton   are we trying to write out of bounds?
+Anton   that shouldn't happen because we have checked i_size at entry of
+	function
+Anton   but I thought double checking here can't hurt...
+Anton   the number of bytes to copy. Maximum is one page.
+Anton   really the capping will never happen...
+Rich    yeah
+Anton   now, kmap_atomic [atomic because much faster]
+Anton   the page
+Anton   on lowmem system that's a noop
+Anton   copy from the page to the mapped mft record
+Anton   unmap
+Anton   unlock
+Anton   the page
+Anton   we are finished with it.
+Anton   i/o is complete
+Anton   we really need to mark the mft record dirty so it gets written to disk
+Rich    yeah
+Anton   but we don't have that facility yet so we just spew a "not supported"
+	error
+Anton   cleanup and unlock the mft record
+Anton   Ok, now a few complications which I skipped over
+Anton   to play nice with the 2.5 VM the page should not be locked while i/o
+	happens
+Anton   instead it should be marked as undergoing PageWriteback.
+Anton   However, in this case we are not really hitting the disk
+Rich    ok
+Anton   in normal case the mft record will already be in memory so all this is
+	just a few cpu cycles and we are done and unlocking the page
+Anton   but still it may be nice to do the page write back thing anyway.
+Anton   However on Andrew Morton's advice we don't do it for now until the 2.5
+	VM has settled down.
+Anton   Next thing is that if an error occurs
+Anton   we need to handle it
+Anton   If it is -ENOMEM, we really want to tell the VM: "it wasn't a real
+	error, but we couldn't complete the write, please try again later"
+Anton   Otherwise it is an error that cannot be recovered from so we want to
+	return a real error.
+Anton   So on -ENOMEM, we give a warning
+Anton   and we reinject the page by marking it dirty
+Rich    ok
+Anton   and return 0 (i.e. no error)
+Anton   otherwise we error message and set the PageError flag
+Anton   then unlock, cleanup and return the actual error code.
+Anton   ok last point
+Anton   read the comment at screen top
+Anton   I will just paste you something from the mmap(2) man page:
+Anton   For a file that is not a multiple of the page size, the remaining
+	memory is zeroed when mapped, and writes to that region are not
+	written out to the file.
+Anton   [quote end]
+Rich    ok
+Anton   Now think what mmap(2) means -> user has access to the whole page and
+	can modify the page contents beyond i_size.
+Anton   And the man page tells us that we have to zero out the beyond i_size
+	page contents
+Anton   [otherwise we could write them out accidentally]
+Rich    I see
+Anton   But for resident files, we are doing a memcpy() which we stop at
+	i_size (attr_len)
+Anton   so we can't get it wrong
+Anton   so we don't need to do the memset
+Rich    yeah
+Anton   the only things we need to keep in mind is what I have put to paper in
+	the comment
+Anton   i.e. if i_size goes up, we need to make sure that the memory between
+	the current i_size and the new i_size is zeroed
+Rich    yeah
+Anton   otherwise would find the users data in there which we didn't zero out
+	here
+Anton   ok
+Anton   So once we implement file extension, we will need to review whether we
+	can afford to skip the memset here or not.
+Anton   just something to keep in mind for later...
+Anton   Right so that is the resident file/attribute case.
+Anton   It was easy right?
+Rich    yeah, no problems
+Anton   cool
+Anton   now non-resident
+Anton   if it is unnamed data [same as readpage]
+Anton   deny access to encrypted files.
+Anton   we don't want to corrupt the encrypted data after all...
+Anton   we need to implement writes to compressed files. lets leave that for
+	later
+Anton   [preferable a _looooot_ later (-;]
+Rich    yeah
+Anton   so just return -EOPNOTSUP.
+Anton   note we don't SetPageError()
+Anton   that would be bad as there is nothing wrong. It's just we don't know
+	what to do.
+Rich    so they can carry on working
+Anton   yes
+Rich    would we have allowed them to get this far?
+Anton   yes, because compressed files can be read
+Rich    would we have allowed: open (..., O_RDWR)
+Anton   yes. as it is now
+Anton   but that is an idea, we could just modify ntfs_read_locked_inode
+Anton   to use a special set of file+inode+aops operations not allowing writes
+	if NInoCompressed()
+Anton   But I don't see the point, we might as well do it this way...
+Anton   It will be implemented one day. (-;
+        Rich tries not to laugh :-)
+Anton   Jeff Garzik actually had a nice idea for Rich:
+Rich    uncompress the files for them?
+Anton   when writing to a compressed file, write an uncompressed compression
+	block.
+Rich    simple, but effective
+Anton   i.e. pretend that compression failed (data is not compressible)
+Anton   and just store the data as is.
+Anton   that will work
+Rich    indeed
+Anton   and it should be relatively easy to implement.
+Anton   anyway, carrying on
+Anton   currently we can't cope with sparse files.
+Anton   Actually we can remove this check already as ntfs_write_block() will
+	return -EOPNOTSUPP on a write into a hole.
+Rich    I see
+Anton   But we may as well leave it in for now... Doesn't hurt.
+Anton   Less potential bugs for the moment.
+Anton   (-;
+Anton   the mmap zeroing rule
+Anton   atomic kmap. memset, flush dcache, kunmap
+Rich    ok
+Anton   (ps. Andrew Morton said that for simple cases like this where we know
+	we will not schedule we should always use atomic kmaps, because of
+	their much higher speed)
+Rich    ok
+Anton   (pps. note that the first thing kmap_atomic does is to
+	disable_preemption to ensure we won't schedule!)
+Rich    hehe, ok
+Anton   (-:
+Anton   we really can't cope with MstProtected attributes at the moment.
+Anton   it is a completely different kettle of fish compared to normal file
+	writing
+Anton   Phew, it is a normal non-resident data stream! (-:
+Anton   ntfs_write_block deals with them beasts.
+Anton   If you want to just read the comment
+Rich    ok
+Rich    done
+Anton   note this is extremely similar to __block_write_full_page [in case you
+	ever look and notice (-:]
+Rich    ok
+Anton   those two are guaranteed but doesn't hurt to double check
+        Anton being paranoid here
+Anton   if there aren't buffers yet, create them
+Anton   but make sure the page is uptodate
+Anton   [as before, when there are no buffers the page must be uptodate]
+Anton   note we create all buffers marked uptodate and dirty by default
+Rich    yes
+Anton   this bit does that
+Anton   we know page is dirty, so we want all the buffers dirty so we write
+	them all (remembering that buffer state is definitive and page state
+	is only a hint as soon as buffers appear)
+Anton   note that if page straddles i_size we now may have dirty buffers
+	outside i_size.
+Rich    ok
+Anton   as a little aside in case you ever wonder: the buffers are now in a
+	completely invalid state
+Anton   they are uptodate and dirty, yet they are not mapped to their disk
+	location
+Anton   that is meaningless
+Rich    I see
+Anton   but we hold the PageLock so we can do whatever we want
+Anton   [actually I am not convinced by the fact that non-mapped, uptodate,
+	dirty buffers are invalid
+Anton   I think they are perfectly valid and happen over holes]
+        Anton makes a note to email akpm about this
+Rich    ok
+Anton   ok ,regardless we carry
+Anton   on
+Anton   set head to the first buffer.
+Anton   note we never modify head after this so we can always use it as a
+	reference to the first buffer
+Anton   and we use bh as current buffer
+Rich    ok
+Anton   the allocation failed.
+Anton   as before, warning and reinject the page
+Anton   just like ntfs_writepage does on enomem
+Rich    should we release the buffers there, if we allocated them?
+Anton   the allocation failed, so we didn't allocate them... (-;
+Anton   page_buffers() returns the buffers or NULL if there are no buffers.
+Rich    ok, I see
+Rich    (just looking at that in a different window)
+Anton   I probably should have said:
+Anton   create_empty_buffers
+Anton   not only allocates them, but also attaches them to page
+Anton   allocate
+Anton   initialize
+Anton   attach to the page.
+Rich    ok
+Anton   free everything if we failed
+Anton   [i.e. no need for us to cleanup]
+Anton   note this
+Rich    yes
+Anton   sorry, it is confusing... if you read ntfs_read_block or
+	__block_write_full_page
+Anton   but such is life (-;
+Anton   this is the logical offset of the first block in the file
+Anton   which is the first block in this page
+Anton   er, did that sentence make any sense?
+Rich    yeah, just about :-)
+Anton   (-:
+Anton   this is the first _fully_invalid_ block
+Anton   [note the rounding up of i_size upwards]
+Rich    yes
+Anton   and the last _fully_or_partially_*valid* initialized block
+Anton   (I know it must seem strange we are using different semantics here but
+	you will see later why)
+Anton   I couldn't see any other way to do it.
+Rich    ok
+Anton   I actually had to write a little test program to figure out the exact
+	boundary conditions required and that came up with the above...
+Anton   very important comment
+Rich    ok
+Anton   and of course we may have dirty buffers outside i_size because we just
+	created them dirty.
+Anton   ok so we need to go thought each buffer in a loop
+Anton   and all dirty buffers must be mapped, otherwise we can't write them
+Anton   Ignore the blockdev mapping aliases comment for now.
+Anton   That is complexity we don't want to even start thinking about yet.
+Rich    ok
+Anton   for every buffer we start with is_retry = FALSE;
+Anton   ok, now check if the buffer is fully outside i_size
+Anton   (dblock is first invalid block so >= dblock catches them all)
+Rich    yeah
+Anton   and in that case we just clear dirty bit and set uptodate bit on the
+	buffer.
+Anton   I am not convinced by the unconditional set_uptodate.
+Anton   [see my FIXME: with race window]
+Anton   that is something I want to talk to Andrew Morton about.
+Rich    hmm
+Anton   the page could in theory at this point be !uptodate.
+Anton   and this would make a potentially nonuptodate buffer uptodate even
+	though it contains garbage
+Anton   that would be bad
+Rich    indeed
+Anton   yes, anyway
+Anton   we skip to the next buffer
+Anton   go to the next block, and the next buffer_head.
+Anton   abort the loop when we get back to the head
+Anton   (don't know if I ever mentioned that the buffers are in a circular
+	list, but that is probably obvious from the usage)
+Rich    yes, you did mention it
+Anton   ok, now the rule: buffer state is definitive, so if not dirty, don't
+	write it.
+Anton   skip ahead
+Anton   [as a little aside in 2.4 the page state is definitive. ->writepage()
+	must ignore buffer state and write all buffers]
+Anton   [i.e. in 2.4 writepage actually sets all buffers dirty itself.]
+Rich    ah, ok
+Anton   [enough 2.4 excursions...]
+Anton   you see how 2.4 and 2.5 are rather different. not funny...
+Anton   ok so the buffer is dirty
+Anton   but it may be beyond the initialized size
+Anton   [note what we did in ntfs_readpage for this case: we mapped the buffer
+	so it would point to the allocated disk block, and we memset() the
+	buffer contents to zero, and set the buffer uptodate, without ever
+	reading it from disk]
+Anton   now we can be coming in after a readpage, i.e. buffer is mapped already
+Rich    ok
+Anton   or we the buffer may be unmapped because we just created it
+Anton   In any case, we need to extend the initialized size because we are
+	actually writing data now
+Anton   [hm, think of it perhaps we ought to memcmp() the buffers for being
+	zero? then no need to write]
+        Anton makes a note
+Anton   ok, so we need to extend initialized_size.
+Anton   two cases:
+Anton   this buffer lies completely outside initialized_size
+Anton   or this buffer straddles it
+Rich    ok
+Anton   note this check
+Anton   one is for us straddling or exceeding initialized_size (iblock)
+Rich    I see
+Anton   and the second is making sure that the initialized_size != the data
+	size.
+Anton   [argh. this is dumb. we just found a bug]
+Anton   iblock and dblock have different semantics
+Anton   so we can't compare them like this
+Anton   that should be correct
+Anton   let me just change my tree
+Anton   ok
+Anton   note why we need to do the second part
+Anton   otherwise all buffers straddling i_size will trigger thinking they
+	don't have enough initialized size
+Rich    ok
+Anton   which while true, is irrelevant as they are beyond data size
+Anton   or i_size
+Anton   [I get very mixed because of the i in i_size...]
+Anton   [you probably noticed... (-;]
+Rich    slightly
+Anton   ok so if this block is fully outside initialized size, we need to fill
+	in the gap between the old initialized size and the current position
+	and update initialized_size
+Anton   this means we need to get all the pages, zero them, and write them back.
+Anton   or at least mark them dirty, they can be written back whenever the VM
+	feels like it.
+Anton   this is of course all unimplemented for now (-;
+Rich    yeah, ok
+Anton   but I spent some time thinking about what needs doing.
+Anton   I think my comments are pretty exhaustive and could pretty much be
+	turned into code straight out
+Rich    yep :-)
+Anton   I thought using ntfs_readpage() to zero the pages and map the buffers
+	for us was quite a neat little trick... (-8
+Rich    hmm, cunning
+Anton   note of course this doesn't work for the current page
+Anton   we hold the page lock so we would deadlock
+Rich    ok
+Anton   the off by one difference here makes sure we never end up here for the
+	current page
+Anton   The only reason I left this unimplemented is that we have no facility
+	of writing out the mft record yet so we can't update the
+	initialized_size on disk yet
+Rich    ok
+Anton   ok so now we have extended initialized_size to the current page.
+Anton   now deal with the current page.
+Anton   a complication
+Anton   if the page is not uptodate there may be nonuptodate buffers which
+	were not dirty and which we skipped above
+Anton   (this can happen on small writes via write(2) and
+	prepare_/commit_write.)
+Rich    ok
+Anton   so we need to go through all buffers and zero them by hand, set them
+	uptodate and dirty.
+Anton   again not implemented
+Anton   now we would need to update initialized_size again
+Anton   this seems silly to update the initialized_size twice
+Anton   but I can't see how to do it otherwise without a billion race
+	conditions.
+Rich    ok
+Anton   and considering how often this code path will trigger on a native
+	windows ntfs fs it doesn't matter
+Anton   [I have so far only ever seen a handful of files where
+	initialized_size < data_size]
+Anton   and they were all windows related system files so it is unlikely
+	anyone would be writing to them under Linux
+Rich    yeah, ok
+Anton   ok break out and set err appropriately.
+Anton   [lets leave error recovery code for later - it is rather involved]
+Rich    [soon an appreciable amount of the driver, will simply be the word,
+	"Sorry"]
+Anton   we have dealt with initialized_size so we are now all ready to go
+Anton   if the buffer is already mapped, no need to do that again
+Anton   mapping a buffer involves:
+Anton   1) set the block device ->b_dev
+Anton   2) set the block number on the disk device ->b_blocknr
+Anton   3) set_buffer_mapped()
+Anton   So we start by setting the block device. That is always the same...
+Rich    ok
+Anton   Now comes the mapping which is virtually identical line for line to
+	ntfs_read_block
+Anton   calculate the vcn and offset into the vcn
+Anton   (vcn_ofs always == 0 for 512 byte clusters)
+Anton   if the rl is still NULL
+Anton   get the run list lock and the run list
+Anton   if there isn't a run list this is the first time it is mapped
+Anton   so we just set lcn to not mapped
+Rich    ok
+Anton   if the rl is there we skip forward in it until the desired vcn
+Anton   and set rl
+Anton   er
+Anton   set lcn
+Rich    yep
+Anton   appropriately
+Anton   next time we get here rl is already in right position so the while
+	loop will be a noop or at most advance rl by one
+Anton   ok all being well, we just mapped the buffer
+Anton   set the block number from the lcn and vcn_ofs
+Anton   set_buffer_mapped() and adios amigos, onto the next buffer
+Anton   if it is a HOLE we are in trouble.
+Anton   we need to allocate cluster(s) to fill the hole
+Anton   we can't do that yet, so we abort with an error
+Rich    ok
+Anton   first time round for this buffer.
+Anton   and it is unmapped
+Anton   now we will be repeating the process so set the flag
+Anton   drop read lock
+Anton   (map_run_list takes it for write)
+Rich    ok
+Anton   if no error, retry
+Anton   take read lock again, set rl
+Anton   reforward into rl, get the lcn...
+Anton   we should now really hit one of the two lcn >= 0 or lcn ==LCN_HOLE
+Anton   otherwise something went wrong
+Rich    yes
+Anton   we dropped the lock so set rl = NULL (we use the rl != NULL as
+	indicator for having to up() the lock)
+Anton   so something went wrong.
+Anton   note it it possible map_run_list() returned err = -ENOMEM for example.
+Rich    ok
+Anton   in which case we would break out without even retrying
+Anton   this is paranoia. Set the buffer to point to -1.
+Anton   error message
+Anton   this triggers if we got here because of is_retry == TRUE or lcn !=
+	LCN_RL_NOT_MAPPED.
+Anton   in that case it's an undefined strange error, so use -EIO.
+Anton   and abort the loop.
+Anton   so now we have all buffers which were dirty, mapped.
+Anton   both for the error case and the non-error case, we need to release the
+	lock if we are still holding it.
+Anton   Everything fine with the mapping?
+Anton   That was a question. (-;
+Rich    sorry, yes, fine
+Anton   ok (-:
+Anton   bh == head if not an error
+Anton   but can be anything on error.
+Anton   so we just reset it to the head
+Anton   if the page is not uptodate, we look at all buffers.
+Anton   if one is not uptodate we stop, reseting back to head
+Rich    ok
+Anton   if all were uptodate we set the page uptodate.
+Anton   [can happen for various reasons, one example would be initialized_size
+	fill in just happened and brought more buffers uptodate]
+Rich    ok
+Anton   ok, now we need to set everything up
+Anton   we only write dirty, mapped buffers
+Anton   a buffer under io must be locked
+Anton   is it still dirty now that we have the lock?
+Anton   perhaps someone wrote it out while we were waiting for the lock?
+Rich    ok
+Anton   if it isn't dirty just unlock it again
+Anton   if it was dirty, it better be uptodate, too!
+Anton   mark it for asynchronous write io
+Anton   uses the standard async write io completion handler
+Rich    ok
+Anton   it is not MstProtected attribute so no need for our special one
+Anton   that just sets the BH_AsyncWrite bit...
+Anton   tags file is gone
+Anton   ah ok (-:
+Anton   that's the one
+Anton   this is why you would not be able to find the function
+Anton   this creates it
+Rich    aha
+Anton   this is the completion handler.
+Anton   it is quite simple
+Anton   if io is successful, set the buffer uptodate
+Anton   otherwise give an error message, clear_buffer_uptodate and setpageerror.
+Rich    ok
+Anton   clear the asyncwrite bit
+Anton   unlock the buffer
+Anton   if there are any async write buffers left, bail out
+Anton   if there aren't end_page_writeback
+Rich    ok
+Anton   still building tags?
+Rich    done
+Anton   huh?
+Anton   simple again (except for the billion barriers...)
+Anton   clear page write back and bug if it wasn't a page under write back
+Anton   wake up people waiting for the page writeback to finish
+Rich    ok
+Anton   if !mapped || !dirty
+Anton   if an error occurred
+Anton   remove the buffer_dirty bit
+Rich    ok
+Anton   (rule: it is not allowed to have a clean page with dirty buffers)
+Rich    yep
+Anton   and we would break the rule if we leave the buffer dirty
+Anton   but only do this for errors which are not -ENOMEM
+Rich    yep
+Anton   as before, we will reinject the page for -ENOMEM later on...
+Rich    yes
+Anton   ok, carrying on
+Anton   ok now all dirty mapped buffers are ready to be handed for the block
+	layer
+Rich    yes
+Anton   we need some special casing on errors
+Anton   don't report errors for -EOPNOTSUPP. We already gave an error message.
+Anton   reinject on ENOMEM
+Rich    ok
+Anton   SetPageError. badness
+Anton   this page is locked by us. it better not be under write back by
+	someone else
+Anton   set the page for writeback and unlock it
+Rich    ok
+Anton   now now anyone can lock the page and think they have exclusive access!
+Anton   read this comment. that is rather important
+Anton   are you happy with it?
+Rich    yep
+Anton   this get_bh() done on _all_ buffers and not undone for any, ensure the
+	buffers don't disappear
+Anton   it pins all buffers belonging to the page until we do put_bh()
+Anton   (once for each buffer)
+Rich    ok
+Anton   assume we need to end_writeback ourselves.
+Anton   if the buffer is marked for writeback, submit it to the block layer
+	for writing
+Anton   (and kiss your hd good bye if we fscked up the mapping... (-;)
+Rich    hehe
+Anton   we submitted at least one buffer, so the async io completion handler
+	will do the end_page_writeback for us
+Anton   put_bh().
+Rich    ok
+Anton   if the completion handler already did end_page_writeback the bh might
+	now no longer exist
+Anton   so we can't look up the next bh!
+Anton   hence this reaching of the next buffer
+Rich    ok
+Anton   again do for all buffers
+Anton   submitting all the prepared ones to the block layer
+Anton   if we didn't start io on any of the buffers
+Anton   we now need to end_page_writeback ourselves
+Anton   and we are done
+Anton   Yey!
+Rich    wahay!
+Anton   err may at this point be < 0, in which case we report some error code
+Anton   if you ever read __block_write_full_page() you will see that they have
+	a separate error code path to the normal one.
+Anton   They also do a lot of weird things
+Rich    ok
+Anton   including a stupid bug
+Anton   [I found it (-:]
+Anton   they submit the buffers and only mark the page for writeback
+	afterwards which is dumb.
+Anton   it will go BUG() on synchronous i/o or if i/o completes quicker than
+	they get to do the SetPageWriteback()
+Anton   I just put the error and non-error code paths together. With a few if
+	(unlikely(err)) in there
+Anton   so it hurts the normal fast path a bit
+Anton   but hey, cpus are fast nowadays (-:
+Rich    :-)
+Rich    Cheers for that, Anton.
+Anton   np
+Anton   just one final point, so I have mentioned it at least
+Rich    aha?
+Anton   when one allocates a new cluster/block, there is the blockdevice
+	aliasing to think about
+Anton   as you can see highlighted, once we allocate, we need to
+	unmap_underlying_metadata() for the bufferhead
+Anton   corresponding to the just allocated block.
+Anton   Al Viro once explained to me why this is necessary but it was
+	extremely complicated.
+Rich    ok, fair enough
+Anton   I may have given you a copy of the relevant irc log excerpt
+Rich    I'll have a look
+Anton   if not I can find it and give it to you if you want.
+Anton   But be prepared to get a headache... (-;
+Rich    :-)
+
